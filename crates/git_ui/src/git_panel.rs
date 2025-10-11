@@ -21,6 +21,7 @@ use editor::{
 };
 use futures::StreamExt as _;
 use git::blame::ParsedCommitMessage;
+use git::repository::RepoPath;
 use git::repository::{
     Branch, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions, GitCommitter,
     PushOptions, Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking,
@@ -28,7 +29,7 @@ use git::repository::{
 };
 use git::stash::GitStash;
 use git::status::StageStatus;
-use git::{Amend, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
+use git::{Amend, Signoff, ToggleStaged, status::FileStatus};
 use git::{
     ExpandCommitEditor, RestoreTrackedFiles, StageAll, StashAll, StashApply, StashPop,
     TrashUntrackedFiles, UnstageAll,
@@ -98,6 +99,10 @@ actions!(
         ToggleSortByPath,
         /// Toggles showing entries in tree vs flat view.
         ToggleTreeView,
+        /// Opens a split diff view for the selected file.
+        OpenSplitDiff,
+        /// Opens an enhanced JetBrains-style diff view for the selected file.
+        OpenEnhancedDiff,
     ]
 );
 
@@ -160,6 +165,8 @@ fn git_panel_context_menu(
             .action("View Stash", zed_actions::git::ViewStash.boxed_clone())
             .separator()
             .action("Open Diff", project_diff::Diff.boxed_clone())
+            .action("Open Split Diff", OpenSplitDiff.boxed_clone())
+            .action("Open Enhanced Diff", OpenEnhancedDiff.boxed_clone())
             .separator()
             .action_disabled_when(
                 !state.has_tracked_changes,
@@ -1011,27 +1018,37 @@ impl GitPanel {
         maybe!({
             let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
             let workspace = self.workspace.upgrade()?;
-            let git_repo = self.active_repository.as_ref()?;
+            workspace.update(cx, |workspace, cx| {
+                project_diff::ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+            });
+            Some(())
+        });
+    }
 
-            if let Some(project_diff) = workspace.read(cx).active_item_as::<ProjectDiff>(cx)
-                && let Some(project_path) = project_diff.read(cx).active_path(cx)
-                && Some(&entry.repo_path)
-                    == git_repo
-                        .read(cx)
-                        .project_path_to_repo_path(&project_path, cx)
-                        .as_ref()
-            {
-                project_diff.focus_handle(cx).focus(window);
-                project_diff.update(cx, |project_diff, cx| project_diff.autoscroll(cx));
-                return None;
-            };
+    fn open_split_diff(&mut self, _: &OpenSplitDiff, window: &mut Window, cx: &mut Context<Self>) {
+        maybe!({
+            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
+            let workspace = self.workspace.upgrade()?;
+            workspace.update(cx, |workspace, cx| {
+                project_diff::ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+            });
+            Some(())
+        });
+    }
 
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
-                })
-                .ok();
-            self.focus_handle.focus(window);
+    fn open_enhanced_diff(
+        &mut self,
+        _: &OpenEnhancedDiff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
+            let workspace = self.workspace.upgrade()?;
+
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+            });
 
             Some(())
         });
@@ -5270,6 +5287,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
+            .on_action(cx.listener(Self::open_split_diff))
+            .on_action(cx.listener(Self::open_enhanced_diff))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::file_history))
             .on_action(cx.listener(Self::focus_changes_list))

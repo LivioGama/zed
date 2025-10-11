@@ -1071,6 +1071,7 @@ pub struct Editor {
     show_breadcrumbs: bool,
     show_gutter: bool,
     show_scrollbars: ScrollbarAxes,
+    vertical_scrollbar_on_left: bool,
     minimap_visibility: MinimapVisibility,
     offset_content: bool,
     disable_expand_excerpt_buttons: bool,
@@ -2244,6 +2245,7 @@ impl Editor {
                 horizontal: full_mode,
                 vertical: full_mode,
             },
+            vertical_scrollbar_on_left: false,
             minimap_visibility: MinimapVisibility::for_mode(&mode, cx),
             offset_content: !matches!(mode, EditorMode::SingleLine),
             show_breadcrumbs: EditorSettings::get_global(cx).toolbar.breadcrumbs,
@@ -20624,6 +20626,11 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_vertical_scrollbar_on_left(&mut self, on_left: bool, cx: &mut Context<Self>) {
+        self.vertical_scrollbar_on_left = on_left;
+        cx.notify();
+    }
+
     pub fn set_minimap_visibility(
         &mut self,
         minimap_visibility: MinimapVisibility,
@@ -25107,6 +25114,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         EditorElement::new(&cx.entity(), self.create_style(cx))
+            .with_vertical_scrollbar_on_left(self.vertical_scrollbar_on_left)
     }
 }
 

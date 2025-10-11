@@ -287,6 +287,7 @@ debugger_ui = { path = "crates/debugger_ui" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 diagnostics = { path = "crates/diagnostics" }
+diff_viewer = { path = "crates/diff_viewer" }
 editor = { path = "crates/editor" }
 eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }
