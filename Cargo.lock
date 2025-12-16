@@ -1247,25 +1247,6 @@ dependencies = [
 
 [[package]]
 name = "async-tungstenite"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0f7efedeac57d9b26170f72965ecfd31473ca52ca7a64e925b0b6f5f079886"
-dependencies = [
- "atomic-waker",
- "futures-core",
- "futures-io",
- "futures-task",
- "futures-util",
- "log",
- "pin-project-lite",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls 0.26.2",
- "tungstenite 0.26.2",
-]
-
-[[package]]
-name = "async-tungstenite"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee88b4c88ac8c9ea446ad43498955750a4bbe64c4392f21ccfe5d952865e318f"
@@ -2121,7 +2102,7 @@ dependencies = [
  "bitflags 2.9.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -3095,7 +3076,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "chrono",
  "clock",
@@ -3311,7 +3292,7 @@ dependencies = [
  "assistant_slash_command",
  "assistant_text_thread",
  "async-trait",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "audio",
  "aws-config",
  "aws-sdk-kinesis",
@@ -8689,7 +8670,7 @@ checksum = "4197fa926a6b0bddfed7377d9fed3d00a0dec44a1501e020097bd26604699cae"
 dependencies = [
  "anyhow",
  "async-trait",
- "async-tungstenite 0.29.1",
+ "async-tungstenite",
  "futures 0.3.31",
  "jupyter-protocol",
  "serde",
@@ -9177,7 +9158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -12593,7 +12574,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.10.1",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -12626,7 +12607,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.101",
@@ -13412,7 +13393,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-dispatcher",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "client",
  "collections",
@@ -13709,7 +13690,7 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-tungstenite 0.31.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "chrono",
  "collections",
@@ -17187,7 +17168,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fb391ac70462b3097a755618fbf9c8f95ecc1eb379a414f7b46f202ed10db1f"
 dependencies = [
  "cc",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -19020,7 +19001,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
