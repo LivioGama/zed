@@ -65,12 +65,12 @@ impl DiffViewer {
             move |bounds, window, cx| {
                 let (left_line_height, left_scroll_pixels, left_bounds) =
                     left_editor.update(cx, |editor, cx| {
-                        let line_height = editor
-                            .style()
-                            .map(|style| {
-                                f32::from(style.text.line_height_in_pixels(window.rem_size()))
-                            })
-                            .unwrap_or(fallback_line_height);
+                        let line_height = f32::from(
+                            editor
+                                .style(cx)
+                                .text
+                                .line_height_in_pixels(window.rem_size()),
+                        );
 
                         let scroll_rows = editor.scroll_position(cx).y;
                         let scroll_pixels = (scroll_rows as f32) * line_height;
@@ -81,12 +81,12 @@ impl DiffViewer {
 
                 let (_right_line_height, right_scroll_pixels, right_bounds) =
                     right_editor.update(cx, |editor, cx| {
-                        let line_height = editor
-                            .style()
-                            .map(|style| {
-                                f32::from(style.text.line_height_in_pixels(window.rem_size()))
-                            })
-                            .unwrap_or(fallback_line_height);
+                        let line_height = f32::from(
+                            editor
+                                .style(cx)
+                                .text
+                                .line_height_in_pixels(window.rem_size()),
+                        );
 
                         let scroll_rows = editor.scroll_position(cx).y;
                         let scroll_pixels = (scroll_rows as f32) * line_height;

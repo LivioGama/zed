@@ -1,4 +1,4 @@
-use editor::{Editor, EditorEvent, EditorMode};
+use editor::{Editor, EditorEvent, EditorMode, SizingBehavior};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Subscription,
     Window, div, prelude::*, px,
@@ -81,14 +81,14 @@ impl DiffViewer {
         self.left_editor.update(cx, |editor, cx| {
             editor.set_scroll_position(gpui::Point::new(0.0, 0.0), window, cx);
             editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
-                s.select_ranges([0..0]);
+                s.select_ranges(vec![Anchor::min()..Anchor::min()]);
             });
         });
 
         self.right_editor.update(cx, |editor, cx| {
             editor.set_scroll_position(gpui::Point::new(0.0, 0.0), window, cx);
             editor.change_selections(editor::SelectionEffects::no_scroll(), window, cx, |s| {
-                s.select_ranges([0..0]);
+                s.select_ranges(vec![Anchor::min()..Anchor::min()]);
             });
         });
 
@@ -177,7 +177,7 @@ impl DiffViewer {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: false,
                     show_active_line_background: false,
-                    sized_by_content: false,
+                    sizing_behavior: SizingBehavior::Default,
                 },
                 left_multibuffer.clone(),
                 None,
@@ -195,7 +195,7 @@ impl DiffViewer {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: false,
                     show_active_line_background: false,
-                    sized_by_content: false,
+                    sizing_behavior: SizingBehavior::Default,
                 },
                 right_multibuffer.clone(),
                 None,
@@ -210,11 +210,14 @@ impl DiffViewer {
 
         let viewport_height = DEFAULT_VIEWPORT_HEIGHT;
 
-        let line_height = left_editor
-            .read(cx)
-            .style()
-            .map(|style| f32::from(style.text.line_height_in_pixels(window.rem_size())))
-            .unwrap_or(DEFAULT_LINE_HEIGHT);
+        let line_height = left_editor.update(cx, |editor, cx| {
+            f32::from(
+                editor
+                    .style(cx)
+                    .text
+                    .line_height_in_pixels(window.rem_size()),
+            )
+        });
 
         let default_visible_lines = viewport_height / line_height;
 
@@ -386,7 +389,7 @@ impl DiffViewer {
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: false,
                     show_active_line_background: false,
-                    sized_by_content: false,
+                    sizing_behavior: SizingBehavior::Default,
                 },
                 self.right_multibuffer.clone(),
                 None,

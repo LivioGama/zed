@@ -5868,18 +5868,20 @@ impl Repository {
         ids
     }
 
-/// Get the committed text for a file at the given repository path.
+    /// Get the committed text for a file at the given repository path.
     pub fn get_committed_text(&mut self, repo_path: RepoPath, cx: &App) -> Task<String> {
         let id = self.id;
         let rx = self.send_job(None, move |state, _| async move {
             match state {
-                RepositoryState::Local { backend, .. } => Ok::<String, anyhow::Error>(
-                    backend
-                        .load_committed_text(repo_path)
-                        .await
-                        .unwrap_or_default(),
-                ),
-                RepositoryState::Remote { project_id, client } => {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    Ok::<String, anyhow::Error>(
+                        backend
+                            .load_committed_text(repo_path)
+                            .await
+                            .unwrap_or_default(),
+                    )
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let request = client.request(proto::LoadCommittedText {
                         project_id: project_id.0,
                         repository_id: id.to_proto(),

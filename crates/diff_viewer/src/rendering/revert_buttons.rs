@@ -20,10 +20,12 @@ impl DiffViewer {
 
         let (current_line_height, current_scroll_pixels) =
             self.left_editor.update(cx, |editor, cx| {
-                let line_height = editor
-                    .style()
-                    .map(|style| f32::from(style.text.line_height_in_pixels(window.rem_size())))
-                    .unwrap_or(self.line_height);
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
                 let scroll_rows = editor.scroll_position(cx).y;
                 let scroll_pixels = (scroll_rows as f32) * line_height;
                 (line_height, scroll_pixels)

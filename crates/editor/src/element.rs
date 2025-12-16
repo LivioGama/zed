@@ -1911,14 +1911,8 @@ impl EditorElement {
 
         let font_id = window.text_system().resolve_font(&self.style.text.font());
         let font_size = self.style.text.font_size.to_pixels(window.rem_size());
-        let gutter_dimensions = snapshot
-            .gutter_dimensions(
-                font_id,
-                font_size,
-                self.max_line_number_width(&snapshot, window),
-                cx,
-            )
-            .unwrap_or_default();
+        let gutter_dimensions =
+            snapshot.gutter_dimensions(font_id, font_size, &self.style, window, cx);
 
         Some(EditorScrollbars::from_scrollbar_axes(
             ScrollbarAxes {
