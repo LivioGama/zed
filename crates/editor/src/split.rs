@@ -168,7 +168,14 @@ pub struct SplittableEditor {
     secondary: Option<SecondaryEditor>,
     panes: PaneGroup,
     workspace: WeakEntity<Workspace>,
+    is_syncing_scroll: bool,
+    pending_scroll_sync: Option<PendingScrollSync>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct PendingScrollSync {
+    target_editor: Entity<Editor>,
+    scroll_position: gpui::Point<crate::scroll::ScrollOffset>,
 }
 
 struct SecondaryEditor {
@@ -249,6 +256,8 @@ impl SplittableEditor {
             secondary: None,
             panes,
             workspace: workspace.downgrade(),
+            is_syncing_scroll: false,
+            pending_scroll_sync: None,
             _subscriptions: subscriptions,
         }
     }
@@ -324,17 +333,34 @@ impl SplittableEditor {
             pane
         });
 
-        let subscriptions =
-            vec![
-                cx.subscribe(&secondary_editor, |this, _, event: &EditorEvent, cx| {
-                    if let EditorEvent::SelectionsChanged { .. } = event
-                        && let Some(secondary) = &mut this.secondary
-                    {
-                        secondary.has_latest_selection = true;
+        let subscriptions = vec![
+            cx.subscribe(&secondary_editor, |this, _, event: &EditorEvent, cx| {
+                if let EditorEvent::SelectionsChanged { .. } = event
+                    && let Some(secondary) = &mut this.secondary
+                {
+                    secondary.has_latest_selection = true;
+                }
+                cx.emit(event.clone())
+            }),
+            // Sync scroll from secondary (left) to primary (right)
+            cx.subscribe(
+                &secondary_editor,
+                |this, editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::ScrollPositionChanged { .. } = event {
+                        this.sync_scroll_from_editor(editor.clone(), false, cx);
                     }
-                    cx.emit(event.clone())
-                }),
-            ];
+                },
+            ),
+        ];
+        // Add scroll sync subscription from primary to secondary
+        self._subscriptions.push(cx.subscribe(
+            &self.primary_editor,
+            |this, editor, event: &EditorEvent, cx| {
+                if let EditorEvent::ScrollPositionChanged { .. } = event {
+                    this.sync_scroll_from_editor(editor.clone(), true, cx);
+                }
+            },
+        ));
         self.secondary = Some(SecondaryEditor {
             editor: secondary_editor,
             pane: secondary_pane.clone(),
@@ -359,6 +385,46 @@ impl SplittableEditor {
             });
         });
         cx.notify();
+    }
+
+    fn sync_scroll_from_editor(
+        &mut self,
+        source_editor: Entity<Editor>,
+        from_primary: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_syncing_scroll {
+            return;
+        }
+        let Some(secondary) = &self.secondary else {
+            return;
+        };
+
+        // Get scroll position from source editor
+        let scroll_position = source_editor.update(cx, |editor, cx| editor.scroll_position(cx));
+
+        let target_editor = if from_primary {
+            secondary.editor.clone()
+        } else {
+            self.primary_editor.clone()
+        };
+
+        // Store pending scroll sync to be applied during render when we have window access
+        self.pending_scroll_sync = Some(PendingScrollSync {
+            target_editor,
+            scroll_position,
+        });
+        cx.notify();
+    }
+
+    fn apply_pending_scroll_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_scroll_sync.take() {
+            self.is_syncing_scroll = true;
+            pending.target_editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(pending.scroll_position, window, cx);
+            });
+            self.is_syncing_scroll = false;
+        }
     }
 
     pub fn added_to_workspace(
@@ -675,6 +741,9 @@ impl Render for SplittableEditor {
         window: &mut ui::Window,
         cx: &mut ui::Context<Self>,
     ) -> impl ui::IntoElement {
+        // Apply any pending scroll sync now that we have window access
+        self.apply_pending_scroll_sync(window, cx);
+
         let has_secondary = self.secondary.is_some();
 
         // Get values that need cx before render_connector_overlay borrows it
