@@ -665,6 +665,107 @@ impl SplittableEditor {
         }
     }
 
+    fn render_crushed_lines(
+        &self,
+        diff_blocks: &[DiffBlock],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Vec<gpui::AnyElement>, Vec<gpui::AnyElement>) {
+        let Some(secondary) = &self.secondary else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let curves = build_connector_curves(diff_blocks);
+        let (deleted_bg, created_bg, _modified_bg) = get_diff_colors(cx);
+
+        // Get layout info from left editor
+        let (line_height, left_scroll_pixels, left_editor_origin_y) =
+            secondary.editor.update(cx, |editor, cx| {
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
+                let scroll_rows = editor.scroll_position(cx).y;
+                let scroll_pixels = (scroll_rows as f32) * line_height;
+                let origin_y = editor
+                    .last_bounds()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(0.0);
+                (line_height, scroll_pixels, origin_y)
+            });
+
+        let (right_scroll_pixels, right_editor_origin_y) =
+            self.primary_editor.update(cx, |editor, cx| {
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
+                let scroll_rows = editor.scroll_position(cx).y;
+                let scroll_pixels = (scroll_rows as f32) * line_height;
+                let origin_y = editor
+                    .last_bounds()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(0.0);
+                (scroll_pixels, origin_y)
+            });
+
+        // Calculate offsets similar to connector drawing
+        let gutter_origin_y = (left_editor_origin_y + right_editor_origin_y) / 2.0;
+        let left_offset = left_editor_origin_y - gutter_origin_y;
+        let right_offset = right_editor_origin_y - gutter_origin_y;
+
+        let mut left_lines = Vec::new();
+        let mut right_lines = Vec::new();
+
+        for curve in curves.iter() {
+            if !curve.left_crushed && !curve.right_crushed {
+                continue;
+            }
+
+            let left_row = curve.left_start as f32;
+            let right_row = curve.right_start as f32;
+
+            let left_top = (left_row * line_height) - left_scroll_pixels + left_offset;
+            let right_top = (right_row * line_height) - right_scroll_pixels + right_offset;
+
+            if curve.left_crushed {
+                // Left side is empty (insertion on right) - draw line on left pane
+                let y_pos = left_top + CRUSHED_BLOCK_HEIGHT / 2.0 - CRUSHED_THICKNESS / 2.0;
+                let line = div()
+                    .id(("crushed-left", curve.block_index))
+                    .absolute()
+                    .top(px(y_pos))
+                    .left_0()
+                    .right_0()
+                    .h(px(CRUSHED_THICKNESS))
+                    .bg(created_bg)
+                    .into_any_element();
+                left_lines.push(line);
+            }
+
+            if curve.right_crushed {
+                // Right side is empty (deletion on left) - draw line on right pane
+                let y_pos = right_top + CRUSHED_BLOCK_HEIGHT / 2.0 - CRUSHED_THICKNESS / 2.0;
+                let line = div()
+                    .id(("crushed-right", curve.block_index))
+                    .absolute()
+                    .top(px(y_pos))
+                    .left_0()
+                    .right_0()
+                    .h(px(CRUSHED_THICKNESS))
+                    .bg(deleted_bg)
+                    .into_any_element();
+                right_lines.push(line);
+            }
+        }
+
+        (left_lines, right_lines)
+    }
+
     fn render_connector_overlay(&self, diff_blocks: &[DiffBlock], cx: &App) -> impl IntoElement {
         let left_editor = self.secondary.as_ref().unwrap().editor.clone();
         let right_editor = self.primary_editor.clone();
@@ -793,21 +894,6 @@ impl SplittableEditor {
             let is_visible = connector_bottom_y >= 0.0 && connector_top_y <= gutter_height;
 
             if is_visible {
-                // Draw crushed indicator for pure insertions/deletions
-                if curve.left_crushed || curve.right_crushed {
-                    Self::draw_crushed_indicator(
-                        window,
-                        bounds,
-                        curve.left_crushed,
-                        curve.right_crushed,
-                        left_top,
-                        left_bottom,
-                        right_top,
-                        right_bottom,
-                        base_color,
-                    );
-                }
-
                 Self::draw_connector_ribbon(
                     window,
                     bounds,
@@ -818,75 +904,6 @@ impl SplittableEditor {
                     control_offset,
                     base_color,
                 );
-            }
-        }
-    }
-
-    fn draw_crushed_indicator(
-        window: &mut Window,
-        bounds: &gpui::Bounds<Pixels>,
-        left_crushed: bool,
-        right_crushed: bool,
-        left_top: f32,
-        left_bottom: f32,
-        right_top: f32,
-        right_bottom: f32,
-        color: Hsla,
-    ) {
-        let gutter_x = f32::from(bounds.origin.x);
-        let gutter_y = f32::from(bounds.origin.y);
-        let gutter_width = f32::from(bounds.size.width);
-
-        // For a crushed block on one side, draw a horizontal line indicator
-        if left_crushed && !right_crushed {
-            // Left side is empty (insertion on right) - draw indicator on left edge
-            let y_center = gutter_y + (left_top + left_bottom) / 2.0;
-            let indicator_width = gutter_width * 0.4;
-
-            let mut builder = PathBuilder::fill();
-            builder.move_to(point(px(gutter_x), px(y_center - CRUSHED_THICKNESS / 2.0)));
-            builder.line_to(point(
-                px(gutter_x + indicator_width),
-                px(y_center - CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.line_to(point(
-                px(gutter_x + indicator_width),
-                px(y_center + CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.line_to(point(px(gutter_x), px(y_center + CRUSHED_THICKNESS / 2.0)));
-            builder.close();
-
-            if let Ok(path) = builder.build() {
-                let background: Background = color.into();
-                window.paint_path(path, background);
-            }
-        } else if right_crushed && !left_crushed {
-            // Right side is empty (deletion on left) - draw indicator on right edge
-            let y_center = gutter_y + (right_top + right_bottom) / 2.0;
-            let indicator_width = gutter_width * 0.4;
-
-            let mut builder = PathBuilder::fill();
-            builder.move_to(point(
-                px(gutter_x + gutter_width - indicator_width),
-                px(y_center - CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.line_to(point(
-                px(gutter_x + gutter_width),
-                px(y_center - CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.line_to(point(
-                px(gutter_x + gutter_width),
-                px(y_center + CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.line_to(point(
-                px(gutter_x + gutter_width - indicator_width),
-                px(y_center + CRUSHED_THICKNESS / 2.0),
-            ));
-            builder.close();
-
-            if let Ok(path) = builder.build() {
-                let background: Background = color.into();
-                window.paint_path(path, background);
             }
         }
     }
@@ -1007,6 +1024,10 @@ impl Render for SplittableEditor {
         // Render buttons first (needs &mut self)
         let revert_buttons = self.render_revert_buttons(&diff_blocks, window, cx);
 
+        // Render crushed line overlays for left and right panes
+        let (left_crushed_lines, right_crushed_lines) =
+            self.render_crushed_lines(&diff_blocks, window, cx);
+
         // Render connector overlay (only needs &self) - convert to AnyElement to end borrow
         let connector_overlay = self
             .render_connector_overlay(&diff_blocks, cx)
@@ -1019,7 +1040,14 @@ impl Render for SplittableEditor {
             .size_full()
             .flex()
             .flex_row()
-            .child(div().flex_1().min_w_0().child(secondary_editor))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .relative()
+                    .child(secondary_editor)
+                    .children(left_crushed_lines),
+            )
             .child(
                 div()
                     .w(px(CONNECTOR_GUTTER_WIDTH))
@@ -1028,7 +1056,14 @@ impl Render for SplittableEditor {
                     .child(connector_overlay)
                     .children(revert_buttons),
             )
-            .child(div().flex_1().min_w_0().child(primary_editor))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .relative()
+                    .child(primary_editor)
+                    .children(right_crushed_lines),
+            )
             .into_any_element()
     }
 }
