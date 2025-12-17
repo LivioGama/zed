@@ -597,13 +597,11 @@ impl SplittableEditor {
                     .max(right_top + CRUSHED_BLOCK_HEIGHT)
             };
 
-            // Position button at the vertical center of the connector
-            let connector_top = left_top.min(right_top);
-            let connector_bottom = left_bottom.max(right_bottom);
-            let connector_center = (connector_top + connector_bottom) / 2.0;
+            // Position button at the vertical center of the left side of the connector
+            let left_center = (left_top + left_bottom) / 2.0;
 
             let button_size = 16.0;
-            let button_top = connector_center - button_size / 2.0;
+            let button_top = left_center - button_size / 2.0;
 
             // Skip if button would be off-screen (using a reasonable viewport estimate)
             if button_top + button_size < 0.0 || button_top > 2000.0 {
