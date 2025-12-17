@@ -590,7 +590,7 @@ impl SplittableEditor {
                     .max(left_top + CRUSHED_BLOCK_HEIGHT)
             };
 
-            let right_bottom = if curve.right_crushed {
+            let _right_bottom = if curve.right_crushed {
                 right_top + CRUSHED_BLOCK_HEIGHT
             } else {
                 ((curve.right_end as f32 + 1.0) * line_height - right_scroll_pixels + right_offset)
@@ -615,7 +615,7 @@ impl SplittableEditor {
                 .id(("revert-btn", block_index))
                 .absolute()
                 .top(px(button_top))
-                .left(px((CONNECTOR_GUTTER_WIDTH - button_size) / 2.0))
+                .left(px(-button_size - 4.0))
                 .child(
                     IconButton::new(("revert", block_index), IconName::ArrowRight)
                         .icon_size(IconSize::XSmall)
