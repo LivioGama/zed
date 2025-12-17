@@ -17,7 +17,7 @@ use crate::{Editor, EditorEvent};
 const BEZIER_SEGMENTS: usize = 48;
 const CONNECTOR_BASE_CONTROL_OFFSET_RATIO: f32 = 0.35;
 const CRUSHED_BLOCK_HEIGHT: f32 = 4.0;
-const CRUSHED_THICKNESS: f32 = 2.0;
+const CRUSHED_THICKNESS: f32 = 4.0;
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.18;
 const CONNECTOR_GUTTER_WIDTH: f32 = 48.0;
 
@@ -841,7 +841,7 @@ impl SplittableEditor {
         if left_crushed && !right_crushed {
             // Left side is empty (insertion on right) - draw indicator on left edge
             let y_center = gutter_y + (left_top + left_bottom) / 2.0;
-            let indicator_width = gutter_width * 0.3;
+            let indicator_width = gutter_width * 0.4;
 
             let mut builder = PathBuilder::fill();
             builder.move_to(point(px(gutter_x), px(y_center - CRUSHED_THICKNESS / 2.0)));
@@ -863,7 +863,7 @@ impl SplittableEditor {
         } else if right_crushed && !left_crushed {
             // Right side is empty (deletion on left) - draw indicator on right edge
             let y_center = gutter_y + (right_top + right_bottom) / 2.0;
-            let indicator_width = gutter_width * 0.3;
+            let indicator_width = gutter_width * 0.4;
 
             let mut builder = PathBuilder::fill();
             builder.move_to(point(
