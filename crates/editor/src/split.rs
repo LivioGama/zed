@@ -620,16 +620,35 @@ impl SplittableEditor {
 
     fn revert_hunk(
         &mut self,
-        _block_index: usize,
+        block_index: usize,
         _secondary_editor: &Entity<Editor>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement actual hunk revert logic
-        // This would need to:
-        // 1. Get the text from the secondary (base) editor for this hunk
-        // 2. Replace the corresponding text in the primary (working) editor
-        // For now, this is a placeholder
+        // Get the hunk at the given index from the primary editor
+        let hunks = self.primary_editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx);
+            let snapshot = buffer.snapshot(cx);
+            snapshot.diff_hunks().collect::<Vec<_>>()
+        });
+
+        let Some(hunk) = hunks.get(block_index) else {
+            return;
+        };
+
+        // Use the existing prepare_restore_change mechanism
+        let mut revert_changes = std::collections::HashMap::default();
+        self.primary_editor.update(cx, |editor, cx| {
+            editor.prepare_restore_change(&mut revert_changes, hunk, cx);
+        });
+
+        if !revert_changes.is_empty() {
+            self.primary_editor.update(cx, |editor, cx| {
+                editor.transact(window, cx, |editor, window, cx| {
+                    editor.restore(revert_changes, window, cx);
+                });
+            });
+        }
     }
 
     fn render_connector_overlay(&self, diff_blocks: &[DiffBlock], cx: &App) -> impl IntoElement {
