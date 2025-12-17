@@ -528,10 +528,12 @@ impl SplittableEditor {
 
         let secondary_editor = secondary.editor.clone();
 
-        // Get scroll and line height info from the right (primary) editor
-        // We need the same offset calculation as the connectors use
-        let (line_height, scroll_pixels, right_editor_origin_y) =
-            self.primary_editor.update(cx, |editor, cx| {
+        // Get scroll and line height info - we need to match the connector drawing logic
+        // The connectors calculate: left_offset = left_top_origin - gutter_origin_y
+        // Then position at: (row * line_height) - scroll_pixels + left_offset
+        // For buttons in a relative div, we use the same offset calculation
+        let (line_height, left_scroll_pixels, left_editor_origin_y) =
+            secondary.editor.update(cx, |editor, cx| {
                 let line_height = f32::from(
                     editor
                         .style(cx)
@@ -547,38 +549,52 @@ impl SplittableEditor {
                 (line_height, scroll_pixels, origin_y)
             });
 
-        // Get the left editor origin for calculating the offset
-        let left_editor_origin_y = secondary.editor.update(cx, |editor, _cx| {
-            editor
-                .last_bounds()
-                .map(|b| f32::from(b.origin.y))
-                .unwrap_or(0.0)
-        });
+        let (right_scroll_pixels, right_editor_origin_y) =
+            self.primary_editor.update(cx, |editor, cx| {
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
+                let scroll_rows = editor.scroll_position(cx).y;
+                let scroll_pixels = (scroll_rows as f32) * line_height;
+                let origin_y = editor
+                    .last_bounds()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(0.0);
+                (scroll_pixels, origin_y)
+            });
 
-        // Use the average of both editor origins as the reference point
-        // This matches how the connectors position themselves
-        let editor_offset = (left_editor_origin_y + right_editor_origin_y) / 2.0;
+        // The gutter div starts at the same Y as the editors (approximately)
+        // We use the average editor origin as the gutter origin estimate
+        let gutter_origin_y = (left_editor_origin_y + right_editor_origin_y) / 2.0;
+        let left_offset = left_editor_origin_y - gutter_origin_y;
+        let right_offset = right_editor_origin_y - gutter_origin_y;
 
         let mut buttons = Vec::new();
 
         for curve in curves.iter() {
             // Calculate the Y position for the button based on the connector center
+            // This matches exactly how draw_connectors calculates positions
             let left_row = curve.left_start as f32;
             let right_row = curve.right_start as f32;
 
-            let left_top = (left_row * line_height) - scroll_pixels;
-            let right_top = (right_row * line_height) - scroll_pixels;
+            let left_top = (left_row * line_height) - left_scroll_pixels + left_offset;
+            let right_top = (right_row * line_height) - right_scroll_pixels + right_offset;
 
             let left_bottom = if curve.left_crushed {
                 left_top + CRUSHED_BLOCK_HEIGHT
             } else {
-                (curve.left_end as f32 + 1.0) * line_height - scroll_pixels
+                ((curve.left_end as f32 + 1.0) * line_height - left_scroll_pixels + left_offset)
+                    .max(left_top + CRUSHED_BLOCK_HEIGHT)
             };
 
             let right_bottom = if curve.right_crushed {
                 right_top + CRUSHED_BLOCK_HEIGHT
             } else {
-                (curve.right_end as f32 + 1.0) * line_height - scroll_pixels
+                ((curve.right_end as f32 + 1.0) * line_height - right_scroll_pixels + right_offset)
+                    .max(right_top + CRUSHED_BLOCK_HEIGHT)
             };
 
             // Position button at the vertical center of the connector
@@ -587,7 +603,7 @@ impl SplittableEditor {
             let connector_center = (connector_top + connector_bottom) / 2.0;
 
             let button_size = 16.0;
-            let button_top = connector_center - button_size / 2.0 + editor_offset;
+            let button_top = connector_center - button_size / 2.0;
 
             // Skip if button would be off-screen (using a reasonable viewport estimate)
             if button_top + button_size < 0.0 || button_top > 2000.0 {
