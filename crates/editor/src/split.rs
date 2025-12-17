@@ -9,7 +9,7 @@ use multi_buffer::{MultiBuffer, MultiBufferFilterMode};
 use project::Project;
 use std::ops::Range;
 use theme::ActiveTheme;
-use ui::{App, Context, Render, Window, div};
+use ui::{App, Context, IconButton, IconName, IconSize, Render, Tooltip, Window, div, prelude::*};
 use workspace::{Item, ItemHandle, Pane, PaneGroup, SplitDirection, Workspace};
 
 use crate::{Editor, EditorEvent};
@@ -17,6 +17,7 @@ use crate::{Editor, EditorEvent};
 const BEZIER_SEGMENTS: usize = 48;
 const CONNECTOR_BASE_CONTROL_OFFSET_RATIO: f32 = 0.35;
 const CRUSHED_BLOCK_HEIGHT: f32 = 4.0;
+const CRUSHED_THICKNESS: f32 = 2.0;
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.18;
 const CONNECTOR_GUTTER_WIDTH: f32 = 48.0;
 
@@ -36,12 +37,14 @@ struct ConnectorCurve {
     kind: ConnectorKind,
     left_crushed: bool,
     right_crushed: bool,
+    block_index: usize,
 }
 
 struct DiffBlock {
     left_range: Range<usize>,
     right_range: Range<usize>,
     kind: DiffHunkStatusKind,
+    index: usize,
 }
 
 #[derive(Clone)]
@@ -104,6 +107,7 @@ fn build_connector_curves(blocks: &[DiffBlock]) -> Vec<ConnectorCurve> {
                 kind,
                 left_crushed,
                 right_crushed,
+                block_index: block.index,
             })
         })
         .collect()
@@ -469,7 +473,9 @@ impl SplittableEditor {
             (hunks, display_snapshot)
         });
 
-        for (primary_hunk, secondary_hunk) in primary_hunks.iter().zip(secondary_hunks.iter()) {
+        for (index, (primary_hunk, secondary_hunk)) in
+            primary_hunks.iter().zip(secondary_hunks.iter()).enumerate()
+        {
             let status = primary_hunk.status();
             let kind = status.kind;
 
@@ -501,21 +507,109 @@ impl SplittableEditor {
                 left_range: left_start..left_end,
                 right_range: right_start..right_end,
                 kind,
+                index,
             });
         }
 
         diff_blocks
     }
 
-    fn render_connector_overlay(
+    fn render_revert_buttons(
         &mut self,
+        diff_blocks: &[DiffBlock],
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Vec<gpui::AnyElement> {
+        let Some(secondary) = &self.secondary else {
+            return Vec::new();
+        };
+
+        let curves = build_connector_curves(diff_blocks);
+
+        let secondary_editor = secondary.editor.clone();
+
+        // Get scroll and line height info from the right (primary) editor
+        let (line_height, scroll_pixels, editor_origin_y) =
+            self.primary_editor.update(cx, |editor, cx| {
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
+                let scroll_rows = editor.scroll_position(cx).y;
+                let scroll_pixels = (scroll_rows as f32) * line_height;
+                let origin_y = editor
+                    .last_bounds()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(0.0);
+                (line_height, scroll_pixels, origin_y)
+            });
+
+        let mut buttons = Vec::new();
+
+        for curve in curves.iter() {
+            // Calculate the Y position for the button based on the right side of the connector
+            let right_row = curve.right_start as f32;
+            let right_top = (right_row * line_height) - scroll_pixels;
+
+            let block_height = if curve.right_crushed {
+                CRUSHED_BLOCK_HEIGHT
+            } else {
+                ((curve.right_end as f32 + 1.0) * line_height - scroll_pixels) - right_top
+            };
+
+            // Center the button vertically in the block
+            let button_size = 16.0;
+            let button_top = right_top + (block_height - button_size) / 2.0;
+
+            // Skip if button would be off-screen
+            if button_top + button_size < 0.0 {
+                continue;
+            }
+
+            let block_index = curve.block_index;
+            let secondary_editor_clone = secondary_editor.clone();
+
+            let button = div()
+                .id(("revert-btn", block_index))
+                .absolute()
+                .top(px(button_top + editor_origin_y))
+                .left(px((CONNECTOR_GUTTER_WIDTH - button_size) / 2.0))
+                .child(
+                    IconButton::new(("revert", block_index), IconName::ArrowRight)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Revert this change"))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.revert_hunk(block_index, &secondary_editor_clone, window, cx);
+                        })),
+                )
+                .into_any_element();
+
+            buttons.push(button);
+        }
+
+        buttons
+    }
+
+    fn revert_hunk(
+        &mut self,
+        _block_index: usize,
+        _secondary_editor: &Entity<Editor>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // TODO: Implement actual hunk revert logic
+        // This would need to:
+        // 1. Get the text from the secondary (base) editor for this hunk
+        // 2. Replace the corresponding text in the primary (working) editor
+        // For now, this is a placeholder
+    }
+
+    fn render_connector_overlay(&self, diff_blocks: &[DiffBlock], cx: &App) -> impl IntoElement {
         let left_editor = self.secondary.as_ref().unwrap().editor.clone();
         let right_editor = self.primary_editor.clone();
-        let diff_blocks = self.build_diff_blocks(window, cx);
-        let curves = build_connector_curves(&diff_blocks);
+        let curves = build_connector_curves(diff_blocks);
         let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
 
         canvas(
@@ -640,6 +734,21 @@ impl SplittableEditor {
             let is_visible = connector_bottom_y >= 0.0 && connector_top_y <= gutter_height;
 
             if is_visible {
+                // Draw crushed indicator for pure insertions/deletions
+                if curve.left_crushed || curve.right_crushed {
+                    Self::draw_crushed_indicator(
+                        window,
+                        bounds,
+                        curve.left_crushed,
+                        curve.right_crushed,
+                        left_top,
+                        left_bottom,
+                        right_top,
+                        right_bottom,
+                        base_color,
+                    );
+                }
+
                 Self::draw_connector_ribbon(
                     window,
                     bounds,
@@ -650,6 +759,75 @@ impl SplittableEditor {
                     control_offset,
                     base_color,
                 );
+            }
+        }
+    }
+
+    fn draw_crushed_indicator(
+        window: &mut Window,
+        bounds: &gpui::Bounds<Pixels>,
+        left_crushed: bool,
+        right_crushed: bool,
+        left_top: f32,
+        left_bottom: f32,
+        right_top: f32,
+        right_bottom: f32,
+        color: Hsla,
+    ) {
+        let gutter_x = f32::from(bounds.origin.x);
+        let gutter_y = f32::from(bounds.origin.y);
+        let gutter_width = f32::from(bounds.size.width);
+
+        // For a crushed block on one side, draw a horizontal line indicator
+        if left_crushed && !right_crushed {
+            // Left side is empty (insertion on right) - draw indicator on left edge
+            let y_center = gutter_y + (left_top + left_bottom) / 2.0;
+            let indicator_width = gutter_width * 0.3;
+
+            let mut builder = PathBuilder::fill();
+            builder.move_to(point(px(gutter_x), px(y_center - CRUSHED_THICKNESS / 2.0)));
+            builder.line_to(point(
+                px(gutter_x + indicator_width),
+                px(y_center - CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.line_to(point(
+                px(gutter_x + indicator_width),
+                px(y_center + CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.line_to(point(px(gutter_x), px(y_center + CRUSHED_THICKNESS / 2.0)));
+            builder.close();
+
+            if let Ok(path) = builder.build() {
+                let background: Background = color.into();
+                window.paint_path(path, background);
+            }
+        } else if right_crushed && !left_crushed {
+            // Right side is empty (deletion on left) - draw indicator on right edge
+            let y_center = gutter_y + (right_top + right_bottom) / 2.0;
+            let indicator_width = gutter_width * 0.3;
+
+            let mut builder = PathBuilder::fill();
+            builder.move_to(point(
+                px(gutter_x + gutter_width - indicator_width),
+                px(y_center - CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.line_to(point(
+                px(gutter_x + gutter_width),
+                px(y_center - CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.line_to(point(
+                px(gutter_x + gutter_width),
+                px(y_center + CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.line_to(point(
+                px(gutter_x + gutter_width - indicator_width),
+                px(y_center + CRUSHED_THICKNESS / 2.0),
+            ));
+            builder.close();
+
+            if let Ok(path) = builder.build() {
+                let background: Background = color.into();
+                window.paint_path(path, background);
             }
         }
     }
@@ -763,7 +941,17 @@ impl Render for SplittableEditor {
 
         let secondary_editor = self.secondary.as_ref().unwrap().editor.clone();
         let primary_editor = self.primary_editor.clone();
-        let connector_overlay = self.render_connector_overlay(window, cx);
+
+        // Build diff blocks once and use for both connectors and buttons
+        let diff_blocks = self.build_diff_blocks(window, cx);
+
+        // Render buttons first (needs &mut self)
+        let revert_buttons = self.render_revert_buttons(&diff_blocks, window, cx);
+
+        // Render connector overlay (only needs &self) - convert to AnyElement to end borrow
+        let connector_overlay = self
+            .render_connector_overlay(&diff_blocks, cx)
+            .into_any_element();
 
         div()
             .id("splittable-editor")
@@ -777,7 +965,9 @@ impl Render for SplittableEditor {
                 div()
                     .w(px(CONNECTOR_GUTTER_WIDTH))
                     .bg(surface_bg)
-                    .child(connector_overlay),
+                    .relative()
+                    .child(connector_overlay)
+                    .children(revert_buttons),
             )
             .child(div().flex_1().min_w_0().child(primary_editor))
             .into_any_element()
