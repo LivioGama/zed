@@ -3,16 +3,14 @@ use feature_flags::{FeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
     Action, AppContext as _, Background, Entity, EventEmitter, Focusable, Hsla, NoAction,
     PathBuilder, Pixels, Point as GpuiPoint, Subscription, WeakEntity, canvas, point, prelude::*,
-    px, size,
+    px,
 };
 use multi_buffer::{MultiBuffer, MultiBufferFilterMode};
 use project::Project;
 use std::ops::Range;
 use theme::ActiveTheme;
 use ui::{App, Context, Render, Window, div};
-use workspace::{
-    ActivePaneDecorator, Item, ItemHandle, Pane, PaneGroup, SplitDirection, Workspace,
-};
+use workspace::{Item, ItemHandle, Pane, PaneGroup, SplitDirection, Workspace};
 
 use crate::{Editor, EditorEvent};
 
@@ -20,6 +18,7 @@ const BEZIER_SEGMENTS: usize = 48;
 const CONNECTOR_BASE_CONTROL_OFFSET_RATIO: f32 = 0.35;
 const CRUSHED_BLOCK_HEIGHT: f32 = 4.0;
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.18;
+const CONNECTOR_GUTTER_WIDTH: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectorKind {
@@ -281,8 +280,26 @@ impl SplittableEditor {
                 // TODO(split-diff) this should be at the multibuffer level
                 editor.set_use_base_text_line_numbers(true, cx);
                 editor.added_to_workspace(workspace, window, cx);
+                // Unfold all content for the split diff view
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                editor.unfold_ranges(
+                    &[multi_buffer::MultiBufferOffset(0)..snapshot.len()],
+                    true,
+                    false,
+                    cx,
+                );
                 editor
             })
+        });
+        // Unfold all content in primary editor too
+        self.primary_editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            editor.unfold_ranges(
+                &[multi_buffer::MultiBufferOffset(0)..snapshot.len()],
+                true,
+                false,
+                cx,
+            );
         });
         let secondary_pane = cx.new(|cx| {
             let mut pane = Pane::new(
@@ -361,29 +378,58 @@ impl SplittableEditor {
         }
     }
 
-    fn build_diff_blocks(&self, cx: &App) -> Vec<DiffBlock> {
+    fn build_diff_blocks(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<DiffBlock> {
         let Some(secondary) = &self.secondary else {
             return Vec::new();
         };
 
-        let primary_buffer = self.primary_editor.read(cx).buffer();
-        let primary_snapshot = primary_buffer.read(cx).snapshot(cx);
-        let secondary_buffer = secondary.editor.read(cx).buffer();
-        let secondary_snapshot = secondary_buffer.read(cx).snapshot(cx);
-
         let mut diff_blocks = Vec::new();
 
-        let primary_hunks: Vec<_> = primary_snapshot.diff_hunks().collect();
-        let secondary_hunks: Vec<_> = secondary_snapshot.diff_hunks().collect();
+        // Get display snapshots to convert buffer rows to display rows
+        // This accounts for excerpt headers and other display-level transformations
+        let (primary_hunks, primary_display) = self.primary_editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx);
+            let buffer_snapshot = buffer.snapshot(cx);
+            let hunks: Vec<_> = buffer_snapshot.diff_hunks().collect();
+            let display_snapshot = editor.snapshot(window, cx).display_snapshot;
+            (hunks, display_snapshot)
+        });
+
+        let (secondary_hunks, secondary_display) = secondary.editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx);
+            let buffer_snapshot = buffer.snapshot(cx);
+            let hunks: Vec<_> = buffer_snapshot.diff_hunks().collect();
+            let display_snapshot = editor.snapshot(window, cx).display_snapshot;
+            (hunks, display_snapshot)
+        });
 
         for (primary_hunk, secondary_hunk) in primary_hunks.iter().zip(secondary_hunks.iter()) {
             let status = primary_hunk.status();
             let kind = status.kind;
 
-            let right_start = primary_hunk.row_range.start.0 as usize;
-            let right_end = primary_hunk.row_range.end.0 as usize;
-            let left_start = secondary_hunk.row_range.start.0 as usize;
-            let left_end = secondary_hunk.row_range.end.0 as usize;
+            // Convert buffer rows to display rows
+            let right_start_point = crate::MultiBufferPoint::new(primary_hunk.row_range.start.0, 0);
+            let right_end_point = crate::MultiBufferPoint::new(primary_hunk.row_range.end.0, 0);
+            let left_start_point =
+                crate::MultiBufferPoint::new(secondary_hunk.row_range.start.0, 0);
+            let left_end_point = crate::MultiBufferPoint::new(secondary_hunk.row_range.end.0, 0);
+
+            let right_start = primary_display
+                .point_to_display_point(right_start_point, text::Bias::Left)
+                .row()
+                .0 as usize;
+            let right_end = primary_display
+                .point_to_display_point(right_end_point, text::Bias::Left)
+                .row()
+                .0 as usize;
+            let left_start = secondary_display
+                .point_to_display_point(left_start_point, text::Bias::Left)
+                .row()
+                .0 as usize;
+            let left_end = secondary_display
+                .point_to_display_point(left_end_point, text::Bias::Left)
+                .row()
+                .0 as usize;
 
             diff_blocks.push(DiffBlock {
                 left_range: left_start..left_end,
@@ -395,17 +441,21 @@ impl SplittableEditor {
         diff_blocks
     }
 
-    fn render_connector_overlay(&self, cx: &App) -> impl IntoElement {
+    fn render_connector_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let left_editor = self.secondary.as_ref().unwrap().editor.clone();
         let right_editor = self.primary_editor.clone();
-        let diff_blocks = self.build_diff_blocks(cx);
+        let diff_blocks = self.build_diff_blocks(window, cx);
         let curves = build_connector_curves(&diff_blocks);
         let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
 
         canvas(
             move |bounds, window, cx| {
-                let (left_line_height, left_scroll_pixels, left_editor_bounds) = left_editor
-                    .update(cx, |editor, cx| {
+                let (left_line_height, left_scroll_pixels, left_bounds) =
+                    left_editor.update(cx, |editor, cx| {
                         let line_height = f32::from(
                             editor
                                 .style(cx)
@@ -414,37 +464,35 @@ impl SplittableEditor {
                         );
                         let scroll_rows = editor.scroll_position(cx).y;
                         let scroll_pixels = (scroll_rows as f32) * line_height;
-                        let editor_bounds = editor.last_bounds().cloned();
-                        (line_height, scroll_pixels, editor_bounds)
+                        let bounds = editor.last_bounds().cloned();
+                        (line_height, scroll_pixels, bounds)
                     });
 
-                let (_right_line_height, right_scroll_pixels, right_editor_bounds) = right_editor
-                    .update(cx, |editor, cx| {
-                        let line_height = f32::from(
-                            editor
-                                .style(cx)
-                                .text
-                                .line_height_in_pixels(window.rem_size()),
-                        );
-                        let scroll_rows = editor.scroll_position(cx).y;
-                        let scroll_pixels = (scroll_rows as f32) * line_height;
-                        let editor_bounds = editor.last_bounds().cloned();
-                        (line_height, scroll_pixels, editor_bounds)
-                    });
+                let (right_scroll_pixels, right_bounds) = right_editor.update(cx, |editor, cx| {
+                    let line_height = f32::from(
+                        editor
+                            .style(cx)
+                            .text
+                            .line_height_in_pixels(window.rem_size()),
+                    );
+                    let scroll_rows = editor.scroll_position(cx).y;
+                    let scroll_pixels = (scroll_rows as f32) * line_height;
+                    let bounds = editor.last_bounds().cloned();
+                    (scroll_pixels, bounds)
+                });
 
-                let line_height = left_line_height;
-                let left_top_origin = left_editor_bounds
+                let left_top_origin = left_bounds
                     .as_ref()
                     .map(|b| f32::from(b.origin.y))
                     .unwrap_or(f32::from(bounds.origin.y));
-                let right_top_origin = right_editor_bounds
+                let right_top_origin = right_bounds
                     .as_ref()
                     .map(|b| f32::from(b.origin.y))
                     .unwrap_or(f32::from(bounds.origin.y));
 
                 ConnectorCanvasData {
                     curves,
-                    line_height,
+                    line_height: left_line_height,
                     left_scroll_pixels,
                     right_scroll_pixels,
                     left_top_origin,
@@ -458,7 +506,6 @@ impl SplittableEditor {
                 Self::draw_connectors(&bounds, &data, window);
             },
         )
-        .absolute()
         .size_full()
     }
 
@@ -472,43 +519,41 @@ impl SplittableEditor {
         }
 
         let gutter_width = f32::from(bounds.size.width);
-        let header_height = data.left_top_origin - f32::from(bounds.origin.y);
-        let viewport_top = header_height;
-        let viewport_bottom = f32::from(bounds.size.height);
-
-        let left_offset = data.left_top_origin - f32::from(bounds.origin.y);
-        let right_offset = data.right_top_origin - f32::from(bounds.origin.y);
-
+        let gutter_height = f32::from(bounds.size.height);
+        let gutter_origin_y = f32::from(bounds.origin.y);
         let minimal_block_height = CRUSHED_BLOCK_HEIGHT;
+
+        // Calculate how far down from the gutter top the editor content starts
+        // This accounts for any header/toolbar above the editor content
+        let left_offset = data.left_top_origin - gutter_origin_y;
+        let right_offset = data.right_top_origin - gutter_origin_y;
 
         for curve in &data.curves {
             let left_row = curve.left_start as f32;
             let right_row = curve.right_start as f32;
 
-            let left_y = (left_row * data.line_height) - data.left_scroll_pixels;
-            let right_y = (right_row * data.line_height) - data.right_scroll_pixels;
+            // Position relative to editor content, then add offset from gutter top
+            let left_top = (left_row * data.line_height) - data.left_scroll_pixels + left_offset;
+            let right_top =
+                (right_row * data.line_height) - data.right_scroll_pixels + right_offset;
 
             let left_bottom = if curve.left_crushed {
-                left_y + minimal_block_height
+                left_top + minimal_block_height
             } else {
-                ((curve.left_end as f32 + 1.0) * data.line_height - data.left_scroll_pixels)
-                    .max(left_y + minimal_block_height)
+                ((curve.left_end as f32 + 1.0) * data.line_height - data.left_scroll_pixels
+                    + left_offset)
+                    .max(left_top + minimal_block_height)
             };
 
             let right_bottom = if curve.right_crushed {
-                right_y + minimal_block_height
+                right_top + minimal_block_height
             } else {
-                ((curve.right_end as f32 + 1.0) * data.line_height - data.right_scroll_pixels)
-                    .max(right_y + minimal_block_height)
+                ((curve.right_end as f32 + 1.0) * data.line_height - data.right_scroll_pixels
+                    + right_offset)
+                    .max(right_top + minimal_block_height)
             };
 
-            let adjusted_left_top = left_y + left_offset;
-            let adjusted_left_bottom = left_bottom + left_offset;
-            let adjusted_right_top = right_y + right_offset;
-            let adjusted_right_bottom = right_bottom + right_offset;
-
-            let connector_height = (adjusted_left_bottom - adjusted_left_top)
-                .max(adjusted_right_bottom - adjusted_right_top);
+            let connector_height = (left_bottom - left_top).max(right_bottom - right_top);
             let base_control_offset = gutter_width * CONNECTOR_BASE_CONTROL_OFFSET_RATIO;
             let reference_line_height = data.line_height.max(1.0);
             let control_offset = if connector_height < reference_line_height * 2.0 {
@@ -517,8 +562,8 @@ impl SplittableEditor {
                 base_control_offset
             };
 
-            let connector_top = adjusted_left_top.min(adjusted_right_top);
-            let connector_bottom = adjusted_left_bottom.max(adjusted_right_bottom);
+            let connector_top_y = left_top.min(right_top);
+            let connector_bottom_y = left_bottom.max(right_bottom);
 
             let base_color = match curve.kind {
                 ConnectorKind::Insert => data.created_bg,
@@ -526,19 +571,18 @@ impl SplittableEditor {
                 ConnectorKind::Modify => data.modified_bg,
             };
 
-            let is_visible = connector_bottom >= viewport_top && connector_top <= viewport_bottom;
+            let is_visible = connector_bottom_y >= 0.0 && connector_top_y <= gutter_height;
 
             if is_visible {
                 Self::draw_connector_ribbon(
                     window,
                     bounds,
-                    adjusted_left_top,
-                    adjusted_left_bottom,
-                    adjusted_right_top,
-                    adjusted_right_bottom,
+                    left_top,
+                    left_bottom,
+                    right_top,
+                    right_bottom,
                     control_offset,
                     base_color,
-                    header_height,
                 );
             }
         }
@@ -553,7 +597,6 @@ impl SplittableEditor {
         right_bottom: f32,
         control_offset: f32,
         color: Hsla,
-        header_height: f32,
     ) {
         let segments = BEZIER_SEGMENTS;
         let mut builder = PathBuilder::fill();
@@ -611,24 +654,10 @@ impl SplittableEditor {
         }
 
         if let Ok(path) = builder.build() {
-            let clip_top = f32::from(bounds.origin.y) + header_height;
-            let clip_bounds = gpui::Bounds {
-                origin: point(px(f32::from(bounds.origin.x)), px(clip_top)),
-                size: size(
-                    bounds.size.width,
-                    px(f32::from(bounds.size.height) - header_height),
-                ),
-            };
-
-            window.with_content_mask(
-                Some(gpui::ContentMask {
-                    bounds: clip_bounds,
-                }),
-                |window| {
-                    let background: Background = color.into();
-                    window.paint_path(path, background);
-                },
-            );
+            window.with_content_mask(Some(gpui::ContentMask { bounds: *bounds }), |window| {
+                let background: Background = color.into();
+                window.paint_path(path, background);
+            });
         }
     }
 }
@@ -647,34 +676,41 @@ impl Render for SplittableEditor {
         cx: &mut ui::Context<Self>,
     ) -> impl ui::IntoElement {
         let has_secondary = self.secondary.is_some();
-        let inner = if !has_secondary {
-            self.primary_editor.clone().into_any_element()
-        } else if let Some(active) = self.panes.panes().into_iter().next() {
-            self.panes
-                .render(
-                    None,
-                    &ActivePaneDecorator::new(active, &self.workspace),
-                    window,
-                    cx,
-                )
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
 
-        let connector_overlay = if has_secondary {
-            Some(self.render_connector_overlay(cx))
-        } else {
-            None
-        };
+        // Get values that need cx before render_connector_overlay borrows it
+        let split_listener = cx.listener(Self::split);
+        let unsplit_listener = cx.listener(Self::unsplit);
+        let surface_bg = cx.theme().colors().surface_background;
+
+        if !has_secondary {
+            return div()
+                .id("splittable-editor")
+                .on_action(split_listener)
+                .on_action(unsplit_listener)
+                .size_full()
+                .child(self.primary_editor.clone())
+                .into_any_element();
+        }
+
+        let secondary_editor = self.secondary.as_ref().unwrap().editor.clone();
+        let primary_editor = self.primary_editor.clone();
+        let connector_overlay = self.render_connector_overlay(window, cx);
 
         div()
             .id("splittable-editor")
-            .relative()
-            .on_action(cx.listener(Self::split))
-            .on_action(cx.listener(Self::unsplit))
+            .on_action(split_listener)
+            .on_action(unsplit_listener)
             .size_full()
-            .child(inner)
-            .when_some(connector_overlay, |this, overlay| this.child(overlay))
+            .flex()
+            .flex_row()
+            .child(div().flex_1().min_w_0().child(secondary_editor))
+            .child(
+                div()
+                    .w(px(CONNECTOR_GUTTER_WIDTH))
+                    .bg(surface_bg)
+                    .child(connector_overlay),
+            )
+            .child(div().flex_1().min_w_0().child(primary_editor))
+            .into_any_element()
     }
 }
