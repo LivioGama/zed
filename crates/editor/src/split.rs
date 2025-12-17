@@ -529,7 +529,8 @@ impl SplittableEditor {
         let secondary_editor = secondary.editor.clone();
 
         // Get scroll and line height info from the right (primary) editor
-        let (line_height, scroll_pixels, editor_origin_y) =
+        // We need the same offset calculation as the connectors use
+        let (line_height, scroll_pixels, right_editor_origin_y) =
             self.primary_editor.update(cx, |editor, cx| {
                 let line_height = f32::from(
                     editor
@@ -546,25 +547,50 @@ impl SplittableEditor {
                 (line_height, scroll_pixels, origin_y)
             });
 
+        // Get the left editor origin for calculating the offset
+        let left_editor_origin_y = secondary.editor.update(cx, |editor, _cx| {
+            editor
+                .last_bounds()
+                .map(|b| f32::from(b.origin.y))
+                .unwrap_or(0.0)
+        });
+
+        // Use the average of both editor origins as the reference point
+        // This matches how the connectors position themselves
+        let editor_offset = (left_editor_origin_y + right_editor_origin_y) / 2.0;
+
         let mut buttons = Vec::new();
 
         for curve in curves.iter() {
-            // Calculate the Y position for the button based on the right side of the connector
+            // Calculate the Y position for the button based on the connector center
+            let left_row = curve.left_start as f32;
             let right_row = curve.right_start as f32;
+
+            let left_top = (left_row * line_height) - scroll_pixels;
             let right_top = (right_row * line_height) - scroll_pixels;
 
-            let block_height = if curve.right_crushed {
-                CRUSHED_BLOCK_HEIGHT
+            let left_bottom = if curve.left_crushed {
+                left_top + CRUSHED_BLOCK_HEIGHT
             } else {
-                ((curve.right_end as f32 + 1.0) * line_height - scroll_pixels) - right_top
+                (curve.left_end as f32 + 1.0) * line_height - scroll_pixels
             };
 
-            // Center the button vertically in the block
-            let button_size = 16.0;
-            let button_top = right_top + (block_height - button_size) / 2.0;
+            let right_bottom = if curve.right_crushed {
+                right_top + CRUSHED_BLOCK_HEIGHT
+            } else {
+                (curve.right_end as f32 + 1.0) * line_height - scroll_pixels
+            };
 
-            // Skip if button would be off-screen
-            if button_top + button_size < 0.0 {
+            // Position button at the vertical center of the connector
+            let connector_top = left_top.min(right_top);
+            let connector_bottom = left_bottom.max(right_bottom);
+            let connector_center = (connector_top + connector_bottom) / 2.0;
+
+            let button_size = 16.0;
+            let button_top = connector_center - button_size / 2.0 + editor_offset;
+
+            // Skip if button would be off-screen (using a reasonable viewport estimate)
+            if button_top + button_size < 0.0 || button_top > 2000.0 {
                 continue;
             }
 
@@ -574,7 +600,7 @@ impl SplittableEditor {
             let button = div()
                 .id(("revert-btn", block_index))
                 .absolute()
-                .top(px(button_top + editor_origin_y))
+                .top(px(button_top))
                 .left(px((CONNECTOR_GUTTER_WIDTH - button_size) / 2.0))
                 .child(
                     IconButton::new(("revert", block_index), IconName::ArrowRight)
