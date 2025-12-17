@@ -174,12 +174,25 @@ pub struct SplittableEditor {
     workspace: WeakEntity<Workspace>,
     is_syncing_scroll: bool,
     pending_scroll_sync: Option<PendingScrollSync>,
+    /// Cached scroll correspondence segments for semantic scroll sync
+    scroll_correspondence: Vec<ScrollCorrespondenceSegment>,
     _subscriptions: Vec<Subscription>,
 }
 
 struct PendingScrollSync {
     target_editor: Entity<Editor>,
-    scroll_position: gpui::Point<crate::scroll::ScrollOffset>,
+    source_scroll_row: f32,
+    from_primary: bool,
+}
+
+/// A segment representing a region of correspondence between the two panes.
+/// Unchanged regions have equal sizes; changed regions may have different sizes.
+#[derive(Debug, Clone)]
+struct ScrollCorrespondenceSegment {
+    left_start: f32,
+    left_end: f32,
+    right_start: f32,
+    right_end: f32,
 }
 
 struct SecondaryEditor {
@@ -187,6 +200,153 @@ struct SecondaryEditor {
     pane: Entity<Pane>,
     has_latest_selection: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Builds a correspondence map from diff blocks.
+/// This maps regions between left and right panes, with unchanged regions
+/// having 1:1 correspondence and changed regions having proportional mapping.
+fn build_scroll_correspondence(diff_blocks: &[DiffBlock]) -> Vec<ScrollCorrespondenceSegment> {
+    let mut segments = Vec::new();
+    let mut left_cursor: f32 = 0.0;
+    let mut right_cursor: f32 = 0.0;
+
+    for block in diff_blocks {
+        let left_block_start = block.left_range.start as f32;
+        let right_block_start = block.right_range.start as f32;
+
+        // Add unchanged segment before this diff block (if any)
+        if left_block_start > left_cursor || right_block_start > right_cursor {
+            // The gap before this block is unchanged content
+            // Both sides should have the same gap size in unchanged regions
+            let left_gap = left_block_start - left_cursor;
+            let right_gap = right_block_start - right_cursor;
+
+            // Use the minimum gap to ensure we don't overshoot
+            // (they should be equal for truly unchanged content)
+            let gap = left_gap.min(right_gap);
+
+            if gap > 0.0 {
+                segments.push(ScrollCorrespondenceSegment {
+                    left_start: left_cursor,
+                    left_end: left_cursor + gap,
+                    right_start: right_cursor,
+                    right_end: right_cursor + gap,
+                });
+                left_cursor += gap;
+                right_cursor += gap;
+            }
+
+            // Handle any remaining gap on either side
+            if left_gap > gap {
+                let remaining = left_gap - gap;
+                segments.push(ScrollCorrespondenceSegment {
+                    left_start: left_cursor,
+                    left_end: left_cursor + remaining,
+                    right_start: right_cursor,
+                    right_end: right_cursor,
+                });
+                left_cursor += remaining;
+            }
+            if right_gap > gap {
+                let remaining = right_gap - gap;
+                segments.push(ScrollCorrespondenceSegment {
+                    left_start: left_cursor,
+                    left_end: left_cursor,
+                    right_start: right_cursor,
+                    right_end: right_cursor + remaining,
+                });
+                right_cursor += remaining;
+            }
+        }
+
+        // Add the diff block segment
+        let left_block_size = (block.left_range.end - block.left_range.start) as f32;
+        let right_block_size = (block.right_range.end - block.right_range.start) as f32;
+
+        if left_block_size > 0.0 || right_block_size > 0.0 {
+            segments.push(ScrollCorrespondenceSegment {
+                left_start: left_cursor,
+                left_end: left_cursor + left_block_size,
+                right_start: right_cursor,
+                right_end: right_cursor + right_block_size,
+            });
+            left_cursor += left_block_size;
+            right_cursor += right_block_size;
+        }
+    }
+
+    segments
+}
+
+/// Translates a scroll position from one pane to the corresponding position in the other.
+/// Uses proportional mapping within changed regions and 1:1 mapping in unchanged regions.
+fn translate_scroll_position(
+    source_row: f32,
+    from_left: bool,
+    segments: &[ScrollCorrespondenceSegment],
+    _source_total_rows: f32,
+    target_total_rows: f32,
+) -> f32 {
+    if segments.is_empty() {
+        // No diff blocks - direct 1:1 mapping
+        return source_row;
+    }
+
+    // Find the segment containing the source row
+    for segment in segments {
+        let (source_start, source_end, target_start, target_end) = if from_left {
+            (
+                segment.left_start,
+                segment.left_end,
+                segment.right_start,
+                segment.right_end,
+            )
+        } else {
+            (
+                segment.right_start,
+                segment.right_end,
+                segment.left_start,
+                segment.left_end,
+            )
+        };
+
+        if source_row >= source_start && source_row <= source_end {
+            let source_size = source_end - source_start;
+            let target_size = target_end - target_start;
+
+            if source_size <= 0.0 {
+                // Source segment is empty (crushed) - return target start
+                return target_start;
+            }
+
+            if target_size <= 0.0 {
+                // Target segment is empty (crushed) - return target start
+                return target_start;
+            }
+
+            // Proportional mapping within the segment
+            let progress = (source_row - source_start) / source_size;
+            return target_start + progress * target_size;
+        }
+    }
+
+    // Beyond all segments - extrapolate from the last segment
+    if let Some(last_segment) = segments.last() {
+        let (source_end, target_end) = if from_left {
+            (last_segment.left_end, last_segment.right_end)
+        } else {
+            (last_segment.right_end, last_segment.left_end)
+        };
+
+        let beyond = source_row - source_end;
+        let result = target_end + beyond;
+
+        // Clamp to valid range
+        return result.max(0.0).min(target_total_rows);
+    }
+
+    // Fallback - direct mapping
+    source_row.min(target_total_rows)
 }
 
 impl SplittableEditor {
@@ -262,6 +422,7 @@ impl SplittableEditor {
             workspace: workspace.downgrade(),
             is_syncing_scroll: false,
             pending_scroll_sync: None,
+            scroll_correspondence: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -404,8 +565,9 @@ impl SplittableEditor {
             return;
         };
 
-        // Get scroll position from source editor
-        let scroll_position = source_editor.update(cx, |editor, cx| editor.scroll_position(cx));
+        // Get scroll row from source editor (Y component is the row)
+        let source_scroll_row =
+            source_editor.update(cx, |editor, cx| editor.scroll_position(cx).y as f32);
 
         let target_editor = if from_primary {
             secondary.editor.clone()
@@ -414,21 +576,70 @@ impl SplittableEditor {
         };
 
         // Store pending scroll sync to be applied during render when we have window access
+        // The actual translation will happen in apply_pending_scroll_sync using the correspondence map
         self.pending_scroll_sync = Some(PendingScrollSync {
             target_editor,
-            scroll_position,
+            source_scroll_row,
+            from_primary,
         });
         cx.notify();
     }
 
     fn apply_pending_scroll_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_scroll_sync.take() {
-            self.is_syncing_scroll = true;
-            pending.target_editor.update(cx, |editor, cx| {
-                editor.set_scroll_position(pending.scroll_position, window, cx);
+        let Some(pending) = self.pending_scroll_sync.take() else {
+            return;
+        };
+
+        // Get total rows for both editors to clamp the result
+        let (source_total_rows, target_total_rows) = if pending.from_primary {
+            let primary_rows = self.primary_editor.update(cx, |editor, cx| {
+                editor.buffer().read(cx).snapshot(cx).max_point().row as f32
             });
-            self.is_syncing_scroll = false;
-        }
+            let secondary_rows = self
+                .secondary
+                .as_ref()
+                .map(|s| {
+                    s.editor.update(cx, |editor, cx| {
+                        editor.buffer().read(cx).snapshot(cx).max_point().row as f32
+                    })
+                })
+                .unwrap_or(primary_rows);
+            (primary_rows, secondary_rows)
+        } else {
+            let secondary_rows = self
+                .secondary
+                .as_ref()
+                .map(|s| {
+                    s.editor.update(cx, |editor, cx| {
+                        editor.buffer().read(cx).snapshot(cx).max_point().row as f32
+                    })
+                })
+                .unwrap_or(0.0);
+            let primary_rows = self.primary_editor.update(cx, |editor, cx| {
+                editor.buffer().read(cx).snapshot(cx).max_point().row as f32
+            });
+            (secondary_rows, primary_rows)
+        };
+
+        // Translate the scroll position using semantic correspondence
+        // from_primary means source is right (primary), target is left (secondary)
+        // So from_left for translation is the opposite of from_primary
+        let from_left = !pending.from_primary;
+        let target_scroll_row = translate_scroll_position(
+            pending.source_scroll_row,
+            from_left,
+            &self.scroll_correspondence,
+            source_total_rows,
+            target_total_rows,
+        );
+
+        self.is_syncing_scroll = true;
+        pending.target_editor.update(cx, |editor, cx| {
+            let mut scroll_position = editor.scroll_position(cx);
+            scroll_position.y = crate::scroll::ScrollOffset::from(target_scroll_row);
+            editor.set_scroll_position(scroll_position, window, cx);
+        });
+        self.is_syncing_scroll = false;
     }
 
     pub fn added_to_workspace(
@@ -1018,8 +1229,11 @@ impl Render for SplittableEditor {
         let secondary_editor = self.secondary.as_ref().unwrap().editor.clone();
         let primary_editor = self.primary_editor.clone();
 
-        // Build diff blocks once and use for both connectors and buttons
+        // Build diff blocks once and use for both connectors, buttons, and scroll correspondence
         let diff_blocks = self.build_diff_blocks(window, cx);
+
+        // Update scroll correspondence map for semantic scroll synchronization
+        self.scroll_correspondence = build_scroll_correspondence(&diff_blocks);
 
         // Render buttons first (needs &mut self)
         let revert_buttons = self.render_revert_buttons(&diff_blocks, window, cx);
