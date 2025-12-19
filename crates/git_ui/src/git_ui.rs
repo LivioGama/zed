@@ -12,6 +12,7 @@ use ui::{
 };
 
 mod blame_ui;
+pub mod clone;
 
 use git::{
     repository::{Branch, Upstream, UpstreamTracking, UpstreamTrackingStatus},
