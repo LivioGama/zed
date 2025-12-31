@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use collections::{BTreeMap, HashMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use settings_macros::{MergeFrom, with_fallible_options};
 use util::serde::default_true;
 
@@ -562,4 +563,81 @@ pub enum GitHostingProviderKind {
     Gitea,
     Forgejo,
     SourceHut,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GitIntralineMode {
+    /// Disable intraline highlighting
+    None,
+    /// Highlight differences at the word level
+    #[default]
+    Word,
+    /// Highlight differences at the character level
+    Character,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitSplitDiffViewMode {
+    /// Show split view with left/right panes
+    #[default]
+    Split,
+    /// Show unified view
+    Unified,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWhitespaceMode {
+    /// Don't ignore any whitespace
+    #[default]
+    None,
+    /// Ignore all whitespace
+    All,
+    /// Ignore trailing whitespace
+    Trailing,
+    /// Ignore leading whitespace
+    Leading,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Default)]
+pub struct GitSplitDiffSettingsContent {
+    /// Default view mode for split diffs
+    ///
+    /// Default: split
+    pub default_view: Option<GitSplitDiffViewMode>,
+    /// Number of context lines to show around changes
+    ///
+    /// Default: 3
+    pub context_lines: Option<u32>,
+    /// How to handle whitespace in diffs
+    ///
+    /// Default: none
+    pub ignore_whitespace: Option<GitWhitespaceMode>,
+    /// Whether to synchronize scrolling between panes
+    ///
+    /// Default: true
+    pub sync_scroll: Option<bool>,
+    /// How to highlight intraline differences
+    ///
+    /// Default: word
+    pub intraline: Option<GitIntralineMode>,
+    /// Whether to wrap long lines
+    ///
+    /// Default: false
+    pub word_wrap: Option<bool>,
+    /// Default width for the diff viewer
+    ///
+    /// Default: 800
+    pub default_width: Option<f32>,
+    /// Default height for the diff viewer
+    ///
+    /// Default: 600
+    pub default_height: Option<f32>,
 }

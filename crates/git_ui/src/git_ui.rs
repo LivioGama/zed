@@ -44,6 +44,8 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+pub mod split_diff_model;
+pub mod split_diff_settings;
 pub mod stash_picker;
 pub mod text_diff_view;
 pub mod worktree_picker;
@@ -52,7 +54,9 @@ actions!(
     git,
     [
         /// Resets the git onboarding state to show the tutorial again.
-        ResetOnboarding
+        ResetOnboarding,
+        /// Toggles between unified and split diff views.
+        ToggleSplitDiff
     ]
 );
 

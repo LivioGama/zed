@@ -7,7 +7,6 @@ pub enum ConnectorKind {
 
 #[derive(Debug, Clone)]
 pub struct ConnectorCurve {
-    pub block_index: usize,
     pub focus_line: usize,
     pub left_start: usize,
     pub left_end: usize,
@@ -20,7 +19,6 @@ pub struct ConnectorCurve {
 
 impl ConnectorCurve {
     pub fn new(
-        block_index: usize,
         focus_line: usize,
         left_start: usize,
         left_end: usize,
@@ -31,7 +29,6 @@ impl ConnectorCurve {
         right_crushed: bool,
     ) -> Self {
         Self {
-            block_index,
             focus_line,
             left_start: left_start.min(left_end),
             left_end: left_end.max(left_start),
