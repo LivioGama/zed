@@ -60,6 +60,7 @@ members = [
     "crates/edit_prediction_ui",
     "crates/edit_prediction_context",
     "crates/editor",
+    "crates/encoding_selector",
     "crates/eval",
     "crates/eval_utils",
     "crates/explorer_command_injector",
@@ -295,6 +296,7 @@ derive_refineable = { path = "crates/refineable/derive_refineable" }
 diagnostics = { path = "crates/diagnostics" }
 diff_viewer = { path = "crates/diff_viewer" }
 editor = { path = "crates/editor" }
+encoding_selector = { path = "crates/encoding_selector" }
 eval_utils = { path = "crates/eval_utils" }
 extension = { path = "crates/extension" }
 extension_host = { path = "crates/extension_host" }
