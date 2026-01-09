@@ -2,6 +2,7 @@ use std::any::Any;
 
 use command_palette_hooks::CommandPaletteFilter;
 use commit_modal::CommitModal;
+use diff_viewer::DiffViewer;
 use editor::{Editor, actions::DiffClipboardWithSelectionData};
 use project::ProjectPath;
 use settings::Settings;
@@ -64,6 +65,7 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     file_history_view::init(cx);
+    workspace::register_serializable_item::<DiffViewer>(cx);
 
     cx.observe_new(|editor: &mut Editor, _, cx| {
         conflict_view::register_editor(editor, editor.buffer().clone(), cx);

@@ -7,7 +7,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 use language::{Buffer, Point};
-use multi_buffer::{Anchor, MultiBuffer};
+use multi_buffer::{Anchor, MultiBuffer, MultiBufferRow};
 use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
@@ -16,12 +16,12 @@ use ui::{Tooltip, prelude::*};
 use crate::connector::{ConnectorCurve, ConnectorKind};
 use crate::connector_builder::build_connector_curves;
 use crate::constants::{
-    COLLAPSED_REGION_HEIGHT_MULTIPLIER, COLLAPSED_REGION_TEXT_OPACITY, CONTEXT_LINES,
-    MAX_LINE_COUNT_DISPLAY, MINIMUM_COLLAPSE_THRESHOLD,
+    COLLAPSED_REGION_HEIGHT_MULTIPLIER, CONTEXT_LINES, MINIMUM_COLLAPSE_THRESHOLD,
 };
 use crate::imara::{ImaraBlockOperation, ImaraDiffAnalysis, compute_imara_diff_default};
-
-actions!(diff_viewer, [ToggleCollapseUnchanged]);
+use editor::display_map::CustomBlockId;
+use gpui::{SharedString, Task, WeakEntity};
+use workspace::item::Item;
 
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.5;
 
@@ -79,6 +79,13 @@ struct DiffAdditionHighlight;
 struct DiffDeletionHighlight;
 struct DiffModificationHighlight;
 
+#[derive(Clone)]
+struct CollapsedRegion {
+    block_id: CustomBlockId,
+    start_line: u32,
+    end_line: u32,
+}
+
 pub struct DiffViewer {
     left_editor: Entity<Editor>,
     right_editor: Entity<Editor>,
@@ -87,7 +94,6 @@ pub struct DiffViewer {
     left_multibuffer: Entity<MultiBuffer>,
     right_multibuffer: Entity<MultiBuffer>,
     focus_handle: FocusHandle,
-
     diff_analysis: Option<ImaraDiffAnalysis>,
     connector_curves: Vec<ConnectorCurve>,
     line_height: f32,
@@ -103,12 +109,14 @@ pub struct DiffViewer {
     right_scroll_rows: f32,
     pending_scroll: Option<PendingScroll>,
     _subscriptions: Vec<Subscription>,
-    left_crushed_blocks: Vec<editor::display_map::CustomBlockId>,
-    right_crushed_blocks: Vec<editor::display_map::CustomBlockId>,
-    left_collapsed_blocks: Vec<editor::display_map::CustomBlockId>,
-    right_collapsed_blocks: Vec<editor::display_map::CustomBlockId>,
+    left_crushed_blocks: Vec<CustomBlockId>,
+    right_crushed_blocks: Vec<CustomBlockId>,
+    left_collapsed_regions: Vec<CollapsedRegion>,
+    right_collapsed_regions: Vec<CollapsedRegion>,
     collapse_unchanged_enabled: bool,
 }
+
+actions!(diff_viewer, [ToggleCollapseUnchanged]);
 
 impl EventEmitter<()> for DiffViewer {}
 
@@ -169,25 +177,19 @@ impl DiffViewer {
         multibuffer: &Entity<MultiBuffer>,
         start_line: u32,
         end_line: u32,
-        line_count: usize,
+        _line_count: usize,
+        is_left: bool,
         cx: &Context<Self>,
     ) -> BlockProperties<Anchor> {
-        let start_anchor = multibuffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_before(Point::new(start_line, 0));
-        let end_anchor = multibuffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_before(Point::new(end_line, 0));
-
-        let line_count_text = if line_count > MAX_LINE_COUNT_DISPLAY {
-            format!("{}+ unchanged lines", MAX_LINE_COUNT_DISPLAY)
-        } else {
-            format!("{} unchanged lines", line_count)
-        };
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let start_anchor = snapshot.anchor_before(Point::new(start_line, 0));
+        let end_row = end_line.saturating_sub(1).max(start_line);
+        let end_col = snapshot.line_len(MultiBufferRow(end_row));
+        let end_anchor = snapshot.anchor_after(Point::new(end_row, end_col));
 
         let height = (self.line_height * COLLAPSED_REGION_HEIGHT_MULTIPLIER).max(20.0);
+
+        let viewer = cx.entity().downgrade();
 
         BlockProperties {
             placement: BlockPlacement::Replace(start_anchor..=end_anchor),
@@ -196,22 +198,71 @@ impl DiffViewer {
             render: Arc::new(move |cx| {
                 let theme = cx.theme();
                 let bg_color = theme.colors().surface_background;
-                let text_color = theme.colors().text.opacity(COLLAPSED_REGION_TEXT_OPACITY);
+                let border_color = theme.colors().border;
+
+                let wavy_element = canvas(
+                    move |_bounds, _window, _cx| {},
+                    move |bounds, _data, window, _cx| {
+                        let width = f32::from(bounds.size.width);
+                        let height = f32::from(bounds.size.height);
+                        if width <= 0.0 || height <= 0.0 {
+                            return;
+                        }
+                        let mut builder = PathBuilder::fill();
+                        let amplitude = height / 4.0;
+                        let frequency = 20.0f32 / width;
+                        let mut x = 0.0;
+                        let step = 1.0;
+                        builder.move_to(point(px(0.0), px(height / 2.0)));
+                        while x <= width {
+                            let y_top = height / 2.0 + amplitude * (frequency * x).sin();
+                            builder.line_to(point(px(x), px(y_top)));
+                            x += step;
+                        }
+                        x = width;
+                        while x >= 0.0 {
+                            let y_bottom = height / 2.0 - amplitude * (frequency * x).sin();
+                            builder.line_to(point(px(x), px(y_bottom)));
+                            x -= step;
+                        }
+                        builder.close();
+                        if let Ok(path) = builder.build() {
+                            let background: Background = bg_color.into();
+                            window.paint_path(path, background);
+                        }
+                    },
+                )
+                .size_full();
+
+                let plus_button = div()
+                    .absolute()
+                    .left(px(-32.0))
+                    .top(px((height - 24.0) / 2.0))
+                    .child(
+                        ui::IconButton::new(
+                            (if is_left { "expand-left" } else { "expand-right" }, start_line),
+                            ui::IconName::Plus,
+                        )
+                        .icon_size(ui::IconSize::Small)
+                        .style(ui::ButtonStyle::Filled)
+                        .on_click({
+                            let viewer = viewer.clone();
+                            move |_event, _window, cx| {
+                                if let Some(viewer) = viewer.upgrade() {
+                                    viewer.update(cx, |viewer, cx| {
+                                        viewer.expand_collapsed_region(start_line, is_left, cx);
+                                    });
+                                }
+                            }
+                        }),
+                    );
 
                 div()
+                    .relative()
                     .w_full()
                     .h(px(height))
-                    .bg(bg_color)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(text_color)
-                    .child("⋯")
-                    .child(" ")
-                    .child(line_count_text.clone())
+                    .child(wavy_element)
+                    .child(plus_button)
                     .into_any()
             }),
             priority: 0,
@@ -307,8 +358,8 @@ impl DiffViewer {
             _subscriptions: Vec::new(),
             left_crushed_blocks: Vec::new(),
             right_crushed_blocks: Vec::new(),
-            left_collapsed_blocks: Vec::new(),
-            right_collapsed_blocks: Vec::new(),
+            left_collapsed_regions: Vec::new(),
+            right_collapsed_regions: Vec::new(),
             collapse_unchanged_enabled: true,
         };
 
@@ -1230,32 +1281,60 @@ impl DiffViewer {
         }
     }
 
+    fn expand_collapsed_region(&mut self, start_line: u32, is_left: bool, cx: &mut Context<Self>) {
+        if is_left {
+            if let Some(idx) = self
+                .left_collapsed_regions
+                .iter()
+                .position(|r| r.start_line == start_line)
+            {
+                let region = self.left_collapsed_regions.remove(idx);
+                self.left_editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
+                });
+            }
+        } else {
+            if let Some(idx) = self
+                .right_collapsed_regions
+                .iter()
+                .position(|r| r.start_line == start_line)
+            {
+                let region = self.right_collapsed_regions.remove(idx);
+                self.right_editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
     fn update_collapsed_blocks(&mut self, cx: &mut Context<Self>) {
         if !self.collapse_unchanged_enabled {
             return;
         }
 
-        // Remove existing collapsed blocks
-        if !self.left_collapsed_blocks.is_empty() {
+        let block_ids: Vec<_> = self
+            .left_collapsed_regions
+            .iter()
+            .map(|r| r.block_id)
+            .collect();
+        if !block_ids.is_empty() {
             self.left_editor.update(cx, |editor, cx| {
-                editor.remove_blocks(
-                    self.left_collapsed_blocks.clone().into_iter().collect(),
-                    None,
-                    cx,
-                );
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx);
             });
-            self.left_collapsed_blocks.clear();
+            self.left_collapsed_regions.clear();
         }
 
-        if !self.right_collapsed_blocks.is_empty() {
+        let block_ids: Vec<_> = self
+            .right_collapsed_regions
+            .iter()
+            .map(|r| r.block_id)
+            .collect();
+        if !block_ids.is_empty() {
             self.right_editor.update(cx, |editor, cx| {
-                editor.remove_blocks(
-                    self.right_collapsed_blocks.clone().into_iter().collect(),
-                    None,
-                    cx,
-                );
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx);
             });
-            self.right_collapsed_blocks.clear();
+            self.right_collapsed_regions.clear();
         }
 
         let Some(analysis) = &self.diff_analysis else {
@@ -1343,34 +1422,58 @@ impl DiffViewer {
 
         // Insert collapsed blocks for left
         for range in left_collapsible_ranges {
-            let line_count = range.end - range.start;
-            let block_props = self.create_collapsed_block_properties(
-                &self.left_multibuffer,
-                range.start as u32,
-                range.end as u32,
-                line_count,
-                cx,
-            );
-            let block_ids = self.left_editor.update(cx, |editor, cx| {
-                editor.insert_blocks([block_props], None, cx)
-            });
-            self.left_collapsed_blocks.extend(block_ids);
+            let collapse_start = range.start + CONTEXT_LINES;
+            let collapse_end = range.end.saturating_sub(CONTEXT_LINES);
+
+            if collapse_end > collapse_start {
+                let line_count = collapse_end - collapse_start;
+                let block_props = self.create_collapsed_block_properties(
+                    &self.left_multibuffer,
+                    collapse_start as u32,
+                    collapse_end as u32,
+                    line_count,
+                    true,
+                    cx,
+                );
+                let block_ids = self.left_editor.update(cx, |editor, cx| {
+                    editor.insert_blocks([block_props], None, cx)
+                });
+                for block_id in block_ids {
+                    self.left_collapsed_regions.push(CollapsedRegion {
+                        block_id,
+                        start_line: collapse_start as u32,
+                        end_line: collapse_end as u32,
+                    });
+                }
+            }
         }
 
         // Insert collapsed blocks for right
         for range in right_collapsible_ranges {
-            let line_count = range.end - range.start;
-            let block_props = self.create_collapsed_block_properties(
-                &self.right_multibuffer,
-                range.start as u32,
-                range.end as u32,
-                line_count,
-                cx,
-            );
-            let block_ids = self.right_editor.update(cx, |editor, cx| {
-                editor.insert_blocks([block_props], None, cx)
-            });
-            self.right_collapsed_blocks.extend(block_ids);
+            let collapse_start = range.start + CONTEXT_LINES;
+            let collapse_end = range.end.saturating_sub(CONTEXT_LINES);
+
+            if collapse_end > collapse_start {
+                let line_count = collapse_end - collapse_start;
+                let block_props = self.create_collapsed_block_properties(
+                    &self.right_multibuffer,
+                    collapse_start as u32,
+                    collapse_end as u32,
+                    line_count,
+                    false,
+                    cx,
+                );
+                let block_ids = self.right_editor.update(cx, |editor, cx| {
+                    editor.insert_blocks([block_props], None, cx)
+                });
+                for block_id in block_ids {
+                    self.right_collapsed_regions.push(CollapsedRegion {
+                        block_id,
+                        start_line: collapse_start as u32,
+                        end_line: collapse_end as u32,
+                    });
+                }
+            }
         }
     }
 }
@@ -1540,6 +1643,68 @@ impl DiffViewer {
     ) {
         self.collapse_unchanged_enabled = !self.collapse_unchanged_enabled;
         cx.notify();
+    }
+}
+
+impl Item for DiffViewer {
+    type Event = ();
+
+    fn tab_content(
+        &self,
+        _params: workspace::item::TabContentParams,
+        _window: &Window,
+        _cx: &App,
+    ) -> gpui::AnyElement {
+        ui::Label::new("Diff Viewer").into_any_element()
+    }
+
+    fn tab_content_text(&self, _level: usize, _cx: &App) -> SharedString {
+        "Diff Viewer".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
+        Some(ui::Icon::new(ui::IconName::GitBranch))
+    }
+}
+
+impl workspace::SerializableItem for DiffViewer {
+    fn serialized_item_kind() -> &'static str {
+        "DiffViewer"
+    }
+
+    fn should_serialize(&self, _event: &Self::Event) -> bool {
+        false
+    }
+
+    fn cleanup(
+        _workspace_id: workspace::WorkspaceId,
+        _alive_items: Vec<workspace::ItemId>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn deserialize(
+        _project: Entity<project::Project>,
+        _workspace: WeakEntity<workspace::Workspace>,
+        _workspace_id: workspace::WorkspaceId,
+        _item_id: workspace::ItemId,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        Task::ready(Err(anyhow::anyhow!("Not implemented")))
+    }
+
+    fn serialize(
+        &mut self,
+        _workspace: &mut workspace::Workspace,
+        _item_id: u64,
+        _closing: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        None
     }
 }
 
