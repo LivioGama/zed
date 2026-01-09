@@ -1,7 +1,8 @@
 use gpui::{Pixels, px};
 use serde::{Deserialize, Serialize};
 use settings::{
-    GitIntralineMode, GitSplitDiffViewMode, GitWhitespaceMode, Settings, SettingsContent,
+    GitIntralineMode, GitSplitDiffViewMode, GitWhitespaceMode, RegisterSetting, Settings,
+    SettingsContent,
 };
 
 // Re-export types from settings crate for convenience
@@ -10,7 +11,7 @@ pub use settings::{
     GitSplitDiffViewMode as SplitDiffViewMode, GitWhitespaceMode as WhitespaceMode,
 };
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, RegisterSetting)]
 pub struct SplitDiffSettings {
     pub default_view: SplitDiffViewMode,
     pub context_lines: u32,

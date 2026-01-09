@@ -1,17 +1,18 @@
+use editor::SizingBehavior;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
 use editor::{Editor, EditorEvent, EditorMode, RowHighlightOptions};
 use gpui::{
-    App, Background, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, IntoElement, PathBuilder, Pixels, Point as GpuiPoint, Render,
-    Subscription, Window, canvas, div, point, prelude::*, px, size,
+    App, Background, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
+    PathBuilder, Pixels, Point as GpuiPoint, Render, Subscription, Window, canvas, div, point,
+    prelude::*, px, size,
 };
-use editor::SizingBehavior;
 use language::{Buffer, Point};
 use multi_buffer::Anchor;
 use multi_buffer::MultiBuffer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
+use ui::prelude::*;
 
 use crate::connector::{ConnectorCurve, ConnectorKind};
 use crate::connector_builder::build_connector_curves;
@@ -208,15 +209,14 @@ impl DiffViewer {
 
         let viewport_height = 600.0;
 
-        let line_height = left_editor
-            .update(cx, |editor, cx| {
-                f32::from(
-                    editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size()),
-                )
-            });
+        let line_height = left_editor.update(cx, |editor, cx| {
+            f32::from(
+                editor
+                    .style(cx)
+                    .text
+                    .line_height_in_pixels(window.rem_size()),
+            )
+        });
 
         let default_visible_lines = viewport_height / line_height;
 
@@ -507,7 +507,6 @@ impl DiffViewer {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
 
-
         let (_deleted_bg, created_bg, _modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
@@ -600,7 +599,8 @@ impl DiffViewer {
                                 px(f32::from(bounds.origin.x) + f32::from(bounds.size.width)),
                                 px(clipped_bottom),
                             ));
-                            builder.line_to(point(px(f32::from(bounds.origin.x)), px(clipped_bottom)));
+                            builder
+                                .line_to(point(px(f32::from(bounds.origin.x)), px(clipped_bottom)));
                             builder.close();
 
                             if let Ok(path) = builder.build() {
@@ -615,11 +615,9 @@ impl DiffViewer {
         .size_full()
     }
 
-
     fn render_right_crushed_blocks(&self, cx: &Context<Self>) -> impl IntoElement {
         let curves = self.connector_curves.clone();
         let right_editor = self.right_editor.clone();
-
 
         let (deleted_bg, _created_bg, _modified_bg) = get_diff_colors(cx);
 
@@ -712,7 +710,8 @@ impl DiffViewer {
                                 px(f32::from(bounds.origin.x) + f32::from(bounds.size.width)),
                                 px(clipped_bottom),
                             ));
-                            builder.line_to(point(px(f32::from(bounds.origin.x)), px(clipped_bottom)));
+                            builder
+                                .line_to(point(px(f32::from(bounds.origin.x)), px(clipped_bottom)));
                             builder.close();
 
                             if let Ok(path) = builder.build() {
@@ -731,7 +730,6 @@ impl DiffViewer {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
         let right_editor = self.right_editor.clone();
-
 
         let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
 
@@ -1174,6 +1172,158 @@ impl Focusable for DiffViewer {
     }
 }
 
+impl DiffViewer {
+    fn render_left_editor_revert_buttons(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<impl IntoElement> {
+        let mut buttons = Vec::new();
+        let mut deleted_lines_above = 0usize;
+
+        let rem_size = window.rem_size();
+        let icon_height = ui::IconSize::Small.rems().to_pixels(rem_size);
+        let button_height = ui::ButtonSize::Compact.rems().to_pixels(rem_size);
+
+        let (current_line_height, current_scroll_pixels) =
+            self.left_editor.update(cx, |editor, cx| {
+                let line_height = f32::from(
+                    editor
+                        .style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size()),
+                );
+                let scroll_rows = editor.scroll_position(cx).y;
+                let scroll_pixels = (scroll_rows as f32) * line_height;
+                (line_height, scroll_pixels)
+            });
+
+        for (index, curve) in self.connector_curves.iter().enumerate() {
+            let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
+            let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
+
+            if curve.right_crushed {
+                deleted_lines_above += left_len;
+            } else if !curve.left_crushed && right_len < left_len {
+                deleted_lines_above += left_len - right_len;
+            }
+
+            if !matches!(
+                curve.kind,
+                ConnectorKind::Modify | ConnectorKind::Delete | ConnectorKind::Insert
+            ) {
+                continue;
+            }
+
+            let block_index = curve.block_index;
+            let is_left_empty = curve.left_crushed;
+            let left_offset_rows = if is_left_empty {
+                deleted_lines_above as f32
+            } else {
+                0.0
+            };
+
+            let left_row = if is_left_empty {
+                curve.focus_line as f32 + left_offset_rows
+            } else {
+                curve.left_start as f32
+            };
+
+            let left_y = (left_row * current_line_height) - current_scroll_pixels;
+
+            let minimal_block_height = 4.0;
+            let left_bottom = if is_left_empty {
+                left_y + minimal_block_height
+            } else {
+                ((curve.left_end as f32 + 1.0) * current_line_height - current_scroll_pixels)
+                    .max(left_y + minimal_block_height)
+            };
+
+            let block_height = left_bottom - left_y;
+            let block_center_y = left_y + block_height / 2.0;
+
+            let container_height = block_height
+                .max(button_height.into())
+                .max(icon_height.into());
+            let container_top = block_center_y - container_height / 2.0;
+
+            if container_top + container_height > 0.0 {
+                let button = div()
+                    .absolute()
+                    .right(px(8.0))
+                    .top(px(container_top))
+                    .h(px(container_height))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        ui::IconButton::new(("revert-btn", index), ui::IconName::ArrowRight)
+                            .icon_size(ui::IconSize::Small)
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.handle_revert_block(block_index, cx);
+                            })),
+                    );
+
+                buttons.push(button);
+            }
+        }
+
+        buttons
+    }
+
+    pub fn handle_revert_block(&mut self, block_index: usize, cx: &mut Context<Self>) {
+        let Some(analysis) = &self.diff_analysis else {
+            return;
+        };
+
+        let Some(block) = analysis.blocks.get(block_index) else {
+            return;
+        };
+
+        match block.operation {
+            crate::imara::ImaraBlockOperation::Modify
+            | crate::imara::ImaraBlockOperation::Delete
+                if !block.left_range.is_empty() =>
+            {
+                let old_content = self
+                    .left_buffer
+                    .read(cx)
+                    .text_for_range(
+                        Point::new(block.left_range.start as u32, 0)
+                            ..Point::new(block.left_range.end as u32, 0),
+                    )
+                    .collect::<String>();
+
+                self.right_buffer.update(cx, |buffer, cx| {
+                    let (start, end) = if block.right_range.is_empty() {
+                        let insert_point =
+                            buffer.anchor_before(Point::new(block.right_range.start as u32 + 1, 0));
+                        (insert_point, insert_point)
+                    } else {
+                        let start =
+                            buffer.anchor_before(Point::new(block.right_range.start as u32, 0));
+                        let end = buffer.anchor_after(Point::new(block.right_range.end as u32, 0));
+                        (start, end)
+                    };
+                    buffer.edit([(start..end, old_content)], None, cx);
+                });
+
+                cx.notify();
+            }
+            crate::imara::ImaraBlockOperation::Insert if !block.right_range.is_empty() => {
+                self.right_buffer.update(cx, |buffer, cx| {
+                    let start = buffer.anchor_before(Point::new(block.right_range.start as u32, 0));
+                    let end = buffer.anchor_after(Point::new(block.right_range.end as u32, 0));
+                    buffer.edit([(start..end, String::new())], None, cx);
+                });
+
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Render for DiffViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(visible) = self.left_editor.read(cx).visible_line_count() {
@@ -1298,9 +1448,12 @@ impl Render for DiffViewer {
                                                     .absolute()
                                                     .top_0()
                                                     .left_0()
-                                            .right_0()
-                                            .bottom_0()
+                                                    .right_0()
+                                                    .bottom_0()
                                                     .child(self.render_left_crushed_blocks(cx)),
+                                            )
+                                            .children(
+                                                self.render_left_editor_revert_buttons(window, cx),
                                             ),
                                     ),
                             ),

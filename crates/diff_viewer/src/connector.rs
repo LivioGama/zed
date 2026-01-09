@@ -15,6 +15,7 @@ pub struct ConnectorCurve {
     pub kind: ConnectorKind,
     pub left_crushed: bool,
     pub right_crushed: bool,
+    pub block_index: usize,
 }
 
 impl ConnectorCurve {
@@ -27,6 +28,7 @@ impl ConnectorCurve {
         kind: ConnectorKind,
         left_crushed: bool,
         right_crushed: bool,
+        block_index: usize,
     ) -> Self {
         Self {
             focus_line,
@@ -37,6 +39,7 @@ impl ConnectorCurve {
             kind,
             left_crushed,
             right_crushed,
+            block_index,
         }
     }
 }

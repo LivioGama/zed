@@ -6,7 +6,8 @@ pub fn build_connector_curves(analysis: &ImaraDiffAnalysis) -> Vec<ConnectorCurv
     analysis
         .blocks
         .iter()
-        .filter_map(|block| {
+        .enumerate()
+        .filter_map(|(index, block)| {
             if block.left_range.is_empty() && block.right_range.is_empty() {
                 return None;
             }
@@ -57,6 +58,7 @@ pub fn build_connector_curves(analysis: &ImaraDiffAnalysis) -> Vec<ConnectorCurv
                 kind,
                 left_crushed,
                 right_crushed,
+                index,
             ))
         })
         .collect()

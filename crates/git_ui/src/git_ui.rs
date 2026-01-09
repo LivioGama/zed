@@ -4,6 +4,7 @@ use command_palette_hooks::CommandPaletteFilter;
 use commit_modal::CommitModal;
 use editor::{Editor, actions::DiffClipboardWithSelectionData};
 use project::ProjectPath;
+use settings::Settings;
 use ui::{
     Headline, HeadlineSize, Icon, IconName, IconSize, IntoElement, ParentElement, Render, Styled,
     StyledExt, div, h_flex, rems, v_flex,
@@ -55,12 +56,11 @@ actions!(
     [
         /// Resets the git onboarding state to show the tutorial again.
         ResetOnboarding,
-        /// Toggles between unified and split diff views.
-        ToggleSplitDiff
     ]
 );
 
 pub fn init(cx: &mut App) {
+    split_diff_settings::SplitDiffSettings::register(cx);
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     file_history_view::init(cx);
