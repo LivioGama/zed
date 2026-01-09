@@ -1312,11 +1312,12 @@
     },
   },
   {
-    "context": "StashDiff > Editor",
+    "context": "GitDiff > Editor",
     "bindings": {
       "ctrl-space": "git::ApplyCurrentStash",
       "ctrl-shift-space": "git::PopCurrentStash",
       "ctrl-shift-backspace": "git::DropCurrentStash",
+      "ctrl-shift-.": "diff_viewer::ToggleCollapseUnchanged",
     },
   },
   {

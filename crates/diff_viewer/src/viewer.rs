@@ -3,20 +3,25 @@ use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
 use editor::{Editor, EditorEvent, EditorMode, RowHighlightOptions};
 use gpui::{
     App, Background, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
-    PathBuilder, Pixels, Point as GpuiPoint, Render, Subscription, Window, canvas, div, point,
-    prelude::*, px, size,
+    PathBuilder, Pixels, Point as GpuiPoint, Render, Subscription, Window, actions, canvas, div,
+    point, prelude::*, px, size,
 };
 use language::{Buffer, Point};
-use multi_buffer::Anchor;
-use multi_buffer::MultiBuffer;
+use multi_buffer::{Anchor, MultiBuffer};
 use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 
 use crate::connector::{ConnectorCurve, ConnectorKind};
 use crate::connector_builder::build_connector_curves;
+use crate::constants::{
+    COLLAPSED_REGION_HEIGHT_MULTIPLIER, COLLAPSED_REGION_TEXT_OPACITY, CONTEXT_LINES,
+    MAX_LINE_COUNT_DISPLAY, MINIMUM_COLLAPSE_THRESHOLD,
+};
 use crate::imara::{ImaraBlockOperation, ImaraDiffAnalysis, compute_imara_diff_default};
+
+actions!(diff_viewer, [ToggleCollapseUnchanged]);
 
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.5;
 
@@ -100,6 +105,9 @@ pub struct DiffViewer {
     _subscriptions: Vec<Subscription>,
     left_crushed_blocks: Vec<editor::display_map::CustomBlockId>,
     right_crushed_blocks: Vec<editor::display_map::CustomBlockId>,
+    left_collapsed_blocks: Vec<editor::display_map::CustomBlockId>,
+    right_collapsed_blocks: Vec<editor::display_map::CustomBlockId>,
+    collapse_unchanged_enabled: bool,
 }
 
 impl EventEmitter<()> for DiffViewer {}
@@ -152,6 +160,60 @@ impl DiffViewer {
             height: Some(2),
             style: BlockStyle::Fixed,
             render: Arc::new(move |_| div().absolute().w_full().h(px(2.0)).bg(color).into_any()),
+            priority: 0,
+        }
+    }
+
+    fn create_collapsed_block_properties(
+        &self,
+        multibuffer: &Entity<MultiBuffer>,
+        start_line: u32,
+        end_line: u32,
+        line_count: usize,
+        cx: &Context<Self>,
+    ) -> BlockProperties<Anchor> {
+        let start_anchor = multibuffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_before(Point::new(start_line, 0));
+        let end_anchor = multibuffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_before(Point::new(end_line, 0));
+
+        let line_count_text = if line_count > MAX_LINE_COUNT_DISPLAY {
+            format!("{}+ unchanged lines", MAX_LINE_COUNT_DISPLAY)
+        } else {
+            format!("{} unchanged lines", line_count)
+        };
+
+        let height = (self.line_height * COLLAPSED_REGION_HEIGHT_MULTIPLIER).max(20.0);
+
+        BlockProperties {
+            placement: BlockPlacement::Replace(start_anchor..=end_anchor),
+            height: Some(height as u32),
+            style: BlockStyle::Fixed,
+            render: Arc::new(move |cx| {
+                let theme = cx.theme();
+                let bg_color = theme.colors().surface_background;
+                let text_color = theme.colors().text.opacity(COLLAPSED_REGION_TEXT_OPACITY);
+
+                div()
+                    .w_full()
+                    .h(px(height))
+                    .bg(bg_color)
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(text_color)
+                    .child("⋯")
+                    .child(" ")
+                    .child(line_count_text.clone())
+                    .into_any()
+            }),
             priority: 0,
         }
     }
@@ -245,6 +307,9 @@ impl DiffViewer {
             _subscriptions: Vec::new(),
             left_crushed_blocks: Vec::new(),
             right_crushed_blocks: Vec::new(),
+            left_collapsed_blocks: Vec::new(),
+            right_collapsed_blocks: Vec::new(),
+            collapse_unchanged_enabled: true,
         };
 
         viewer
@@ -1164,6 +1229,150 @@ impl DiffViewer {
             self.right_crushed_blocks.extend(block_ids);
         }
     }
+
+    fn update_collapsed_blocks(&mut self, cx: &mut Context<Self>) {
+        if !self.collapse_unchanged_enabled {
+            return;
+        }
+
+        // Remove existing collapsed blocks
+        if !self.left_collapsed_blocks.is_empty() {
+            self.left_editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    self.left_collapsed_blocks.clone().into_iter().collect(),
+                    None,
+                    cx,
+                );
+            });
+            self.left_collapsed_blocks.clear();
+        }
+
+        if !self.right_collapsed_blocks.is_empty() {
+            self.right_editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    self.right_collapsed_blocks.clone().into_iter().collect(),
+                    None,
+                    cx,
+                );
+            });
+            self.right_collapsed_blocks.clear();
+        }
+
+        let Some(analysis) = &self.diff_analysis else {
+            return;
+        };
+
+        // Collect changed line ranges separately for left and right
+        let mut left_changed_ranges = Vec::new();
+        let mut right_changed_ranges = Vec::new();
+        for block in &analysis.blocks {
+            if !block.left_range.is_empty() {
+                left_changed_ranges.push(block.left_range.clone());
+            }
+            if !block.right_range.is_empty() {
+                right_changed_ranges.push(block.right_range.clone());
+            }
+        }
+
+        // Sort and merge overlapping ranges for left
+        left_changed_ranges.sort_by_key(|r| r.start);
+        let mut left_merged_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in left_changed_ranges {
+            if let Some(last) = left_merged_ranges.last_mut() {
+                if last.end >= range.start {
+                    last.end = last.end.max(range.end);
+                } else {
+                    left_merged_ranges.push(range);
+                }
+            } else {
+                left_merged_ranges.push(range);
+            }
+        }
+
+        // Sort and merge overlapping ranges for right
+        right_changed_ranges.sort_by_key(|r| r.start);
+        let mut right_merged_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in right_changed_ranges {
+            if let Some(last) = right_merged_ranges.last_mut() {
+                if last.end >= range.start {
+                    last.end = last.end.max(range.end);
+                } else {
+                    right_merged_ranges.push(range);
+                }
+            } else {
+                right_merged_ranges.push(range);
+            }
+        }
+
+        // Find unchanged ranges on left
+        let mut left_unchanged_ranges = Vec::new();
+        let mut current_start = 0;
+        for range in &left_merged_ranges {
+            if current_start < range.start {
+                left_unchanged_ranges.push(current_start..range.start);
+            }
+            current_start = current_start.max(range.end);
+        }
+        if current_start < self.left_total_lines {
+            left_unchanged_ranges.push(current_start..self.left_total_lines);
+        }
+
+        // Find unchanged ranges on right
+        let mut right_unchanged_ranges = Vec::new();
+        let mut current_start = 0;
+        for range in &right_merged_ranges {
+            if current_start < range.start {
+                right_unchanged_ranges.push(current_start..range.start);
+            }
+            current_start = current_start.max(range.end);
+        }
+        if current_start < self.right_total_lines {
+            right_unchanged_ranges.push(current_start..self.right_total_lines);
+        }
+
+        // Filter ranges that are long enough to collapse
+        let min_length = 2 * CONTEXT_LINES + MINIMUM_COLLAPSE_THRESHOLD;
+        let left_collapsible_ranges: Vec<_> = left_unchanged_ranges
+            .into_iter()
+            .filter(|r| r.end - r.start >= min_length)
+            .collect();
+        let right_collapsible_ranges: Vec<_> = right_unchanged_ranges
+            .into_iter()
+            .filter(|r| r.end - r.start >= min_length)
+            .collect();
+
+        // Insert collapsed blocks for left
+        for range in left_collapsible_ranges {
+            let line_count = range.end - range.start;
+            let block_props = self.create_collapsed_block_properties(
+                &self.left_multibuffer,
+                range.start as u32,
+                range.end as u32,
+                line_count,
+                cx,
+            );
+            let block_ids = self.left_editor.update(cx, |editor, cx| {
+                editor.insert_blocks([block_props], None, cx)
+            });
+            self.left_collapsed_blocks.extend(block_ids);
+        }
+
+        // Insert collapsed blocks for right
+        for range in right_collapsible_ranges {
+            let line_count = range.end - range.start;
+            let block_props = self.create_collapsed_block_properties(
+                &self.right_multibuffer,
+                range.start as u32,
+                range.end as u32,
+                line_count,
+                cx,
+            );
+            let block_ids = self.right_editor.update(cx, |editor, cx| {
+                editor.insert_blocks([block_props], None, cx)
+            });
+            self.right_collapsed_blocks.extend(block_ids);
+        }
+    }
 }
 
 impl Focusable for DiffViewer {
@@ -1322,6 +1531,16 @@ impl DiffViewer {
             _ => {}
         }
     }
+
+    fn toggle_collapse_unchanged(
+        &mut self,
+        _: &ToggleCollapseUnchanged,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.collapse_unchanged_enabled = !self.collapse_unchanged_enabled;
+        cx.notify();
+    }
 }
 
 impl Render for DiffViewer {
@@ -1406,101 +1625,64 @@ impl Render for DiffViewer {
         }
 
         self.update_crushed_blocks(cx);
+        self.update_collapsed_blocks(cx);
+
+        let collapse_enabled = self.collapse_unchanged_enabled;
+        let collapse_button = ui::Button::new("collapse-toggle", "Collapse Unchanged Fragments")
+            .style(ui::ButtonStyle::Subtle)
+            .icon(if collapse_enabled {
+                ui::IconName::ChevronDown
+            } else {
+                ui::IconName::ChevronUp
+            })
+            .tooltip(move |_window, _cx| {
+                let tooltip_text = if collapse_enabled {
+                    "Disable collapsing of unchanged lines"
+                } else {
+                    "Enable collapsing of unchanged lines"
+                };
+                Tooltip::text(tooltip_text)(_window, _cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.collapse_unchanged_enabled = !this.collapse_unchanged_enabled;
+                cx.notify();
+            }));
 
         div()
             .flex()
             .size_full()
             .bg(cx.theme().colors().background)
+            .on_action(cx.listener(Self::toggle_collapse_unchanged))
             .child(
                 div()
                     .flex_1()
                     .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .flex_1()
+                            .h_8()
                             .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .h_8()
-                                    .flex()
-                                    .items_center()
-                                    .px_3()
-                                    .text_sm()
-                                    .text_color(cx.theme().colors().text)
-                                    .bg(cx.theme().colors().surface_background)
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .child("Original (HEAD)"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .bg(cx.theme().colors().editor_background)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .relative()
-                                            .child(self.left_editor.clone())
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top_0()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .bottom_0()
-                                                    .child(self.render_left_crushed_blocks(cx)),
-                                            )
-                                            .children(
-                                                self.render_left_editor_revert_buttons(window, cx),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(45.))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .h_8()
-                                    .bg(cx.theme().colors().surface_background)
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .bg(cx.theme().colors().surface_background)
-                                    .child(self.render_connectors(cx)),
-                            ),
+                            .items_center()
+                            .px_3()
+                            .text_sm()
+                            .text_color(cx.theme().colors().text)
+                            .bg(cx.theme().colors().surface_background)
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                            .justify_between()
+                            .child("Original (HEAD)")
+                            .child(collapse_button),
                     )
                     .child(
                         div()
                             .flex_1()
                             .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .h_8()
-                                    .flex()
-                                    .items_center()
-                                    .px_3()
-                                    .text_sm()
-                                    .text_color(cx.theme().colors().text)
-                                    .bg(cx.theme().colors().surface_background)
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .child("Modified (Working)"),
-                            )
+                            .bg(cx.theme().colors().editor_background)
                             .child(
                                 div()
                                     .flex_1()
-                                    .bg(cx.theme().colors().editor_background)
                                     .relative()
-                                    .child(self.right_editor.clone())
+                                    .child(self.left_editor.clone())
                                     .child(
                                         div()
                                             .absolute()
@@ -1508,8 +1690,64 @@ impl Render for DiffViewer {
                                             .left_0()
                                             .right_0()
                                             .bottom_0()
-                                            .child(self.render_right_crushed_blocks(cx)),
-                                    ),
+                                            .child(self.render_left_crushed_blocks(cx)),
+                                    )
+                                    .children(self.render_left_editor_revert_buttons(window, cx)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(45.))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h_8()
+                            .bg(cx.theme().colors().surface_background)
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .bg(cx.theme().colors().surface_background)
+                            .child(self.render_connectors(cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h_8()
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .text_sm()
+                            .text_color(cx.theme().colors().text)
+                            .bg(cx.theme().colors().surface_background)
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                            .child("Modified (Working)"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .bg(cx.theme().colors().editor_background)
+                            .relative()
+                            .child(self.right_editor.clone())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .child(self.render_right_crushed_blocks(cx)),
                             ),
                     ),
             )
