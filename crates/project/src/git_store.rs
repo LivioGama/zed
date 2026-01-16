@@ -3610,6 +3610,15 @@ impl Repository {
             })
             .shared();
 
+        // todo! check if this handles fetching remote branches as well
+        cx.subscribe_self(|this, event: &RepositoryEvent, _| match event {
+            RepositoryEvent::BranchChanged | RepositoryEvent::MergeHeadsChanged => {
+                this.initial_graph_data.clear();
+            }
+            _ => {}
+        })
+        .detach();
+
         Repository {
             this: cx.weak_entity(),
             git_store,
