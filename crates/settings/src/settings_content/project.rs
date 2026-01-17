@@ -640,4 +640,8 @@ pub struct GitSplitDiffSettingsContent {
     ///
     /// Default: 600
     pub default_height: Option<f32>,
+    /// Whether to collapse unchanged lines in the diff viewer
+    ///
+    /// Default: true
+    pub collapse_unchanged: Option<bool>,
 }

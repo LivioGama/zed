@@ -1,13 +1,15 @@
 use editor::SizingBehavior;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
 use editor::{Editor, EditorEvent, EditorMode, RowHighlightOptions};
+use fs::Fs;
 use gpui::{
     App, Background, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
-    PathBuilder, Pixels, Point as GpuiPoint, Render, Subscription, Window, actions, canvas, div,
-    point, prelude::*, px, size,
+    PathBuilder, Pixels, Point as GpuiPoint, ReadGlobal, Render, Subscription, Window, actions,
+    canvas, div, point, prelude::*, px, size,
 };
 use language::{Buffer, Point};
 use multi_buffer::{Anchor, MultiBuffer, MultiBufferRow};
+use settings::{SettingsStore, update_settings_file};
 use std::path::PathBuf;
 use std::sync::Arc;
 use theme::ActiveTheme;
@@ -80,11 +82,11 @@ struct DiffDeletionHighlight;
 struct DiffModificationHighlight;
 
 #[derive(Clone)]
-struct CollapsedRegion {
-    block_id: CustomBlockId,
-    region_id: u32,
-    start_line: u32,
-    end_line: u32,
+pub struct CollapsedRegion {
+    pub block_id: CustomBlockId,
+    pub region_id: u32,
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +129,7 @@ pub struct DiffViewer {
     collapse_unchanged_enabled: bool,
     expanded_region_ids: std::collections::HashSet<u32>,
     collapsed_blocks_need_update: bool,
+    fs: Arc<dyn Fs>,
 }
 
 actions!(diff_viewer, [ToggleCollapseUnchanged]);
@@ -278,6 +281,7 @@ impl DiffViewer {
     pub fn new(
         _left_path: Option<PathBuf>,
         _right_path: Option<PathBuf>,
+        fs: Arc<dyn Fs>,
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
@@ -339,6 +343,12 @@ impl DiffViewer {
 
         let default_visible_lines = viewport_height / line_height;
 
+        let collapse_unchanged_enabled = SettingsStore::global(cx)
+            .raw_user_settings()
+            .and_then(|s| s.content.git_split_diff.as_ref())
+            .and_then(|s| s.collapse_unchanged)
+            .unwrap_or(true);
+
         let viewer = Self {
             left_editor,
             right_editor,
@@ -366,9 +376,10 @@ impl DiffViewer {
             right_crushed_blocks: Vec::new(),
             left_collapsed_regions: Vec::new(),
             right_collapsed_regions: Vec::new(),
-            collapse_unchanged_enabled: true,
+            collapse_unchanged_enabled,
             expanded_region_ids: std::collections::HashSet::new(),
             collapsed_blocks_need_update: true,
+            fs,
         };
 
         viewer
@@ -632,12 +643,14 @@ impl DiffViewer {
     fn render_left_crushed_blocks(&self, cx: &Context<Self>) -> impl IntoElement {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
+        let left_collapsed_regions = self.left_collapsed_regions.clone();
 
         let (_deleted_bg, created_bg, _modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct LeftCrushedCanvasData {
             curves: Vec<ConnectorCurve>,
+            collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             left_scroll_pixels: f32,
             left_top_origin: f32,
@@ -669,6 +682,7 @@ impl DiffViewer {
 
                 LeftCrushedCanvasData {
                     curves,
+                    collapsed_regions: left_collapsed_regions.clone(),
                     line_height: left_line_height,
                     left_scroll_pixels,
                     left_top_origin,
@@ -700,7 +714,18 @@ impl DiffViewer {
 
                     if curve.left_crushed {
                         let left_offset_rows = deleted_lines_above as f32;
-                        let left_row = curve.focus_line as f32 + left_offset_rows;
+                        let base_row = curve.focus_line as f32 + left_offset_rows;
+
+                        let mut collapsed_lines_offset: f32 = 0.0;
+                        for region in &data.collapsed_regions {
+                            if region.end_line as f32 <= base_row {
+                                let lines_hidden = (region.end_line - region.start_line) as f32;
+                                let visual_height = 1.0;
+                                collapsed_lines_offset += lines_hidden - visual_height;
+                            }
+                        }
+
+                        let left_row = base_row - collapsed_lines_offset;
                         let left_y = (left_row * data.line_height) - data.left_scroll_pixels;
                         let left_bottom = left_y + minimal_block_height;
 
@@ -744,12 +769,14 @@ impl DiffViewer {
     fn render_right_crushed_blocks(&self, cx: &Context<Self>) -> impl IntoElement {
         let curves = self.connector_curves.clone();
         let right_editor = self.right_editor.clone();
+        let right_collapsed_regions = self.right_collapsed_regions.clone();
 
         let (deleted_bg, _created_bg, _modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct RightCrushedCanvasData {
             curves: Vec<ConnectorCurve>,
+            collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             right_scroll_pixels: f32,
             right_top_origin: f32,
@@ -781,6 +808,7 @@ impl DiffViewer {
 
                 RightCrushedCanvasData {
                     curves,
+                    collapsed_regions: right_collapsed_regions.clone(),
                     line_height: right_line_height,
                     right_scroll_pixels,
                     right_top_origin,
@@ -811,7 +839,18 @@ impl DiffViewer {
 
                     if curve.right_crushed {
                         let right_offset_rows = inserted_lines_above as f32;
-                        let right_row = curve.focus_line as f32 + right_offset_rows;
+                        let base_row = curve.focus_line as f32 + right_offset_rows;
+
+                        let mut collapsed_lines_offset: f32 = 0.0;
+                        for region in &data.collapsed_regions {
+                            if region.end_line as f32 <= base_row {
+                                let lines_hidden = (region.end_line - region.start_line) as f32;
+                                let visual_height = 1.0;
+                                collapsed_lines_offset += lines_hidden - visual_height;
+                            }
+                        }
+
+                        let right_row = base_row - collapsed_lines_offset;
                         let right_y = (right_row * data.line_height) - data.right_scroll_pixels;
                         let right_bottom = right_y + minimal_block_height;
 
@@ -856,12 +895,16 @@ impl DiffViewer {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
         let right_editor = self.right_editor.clone();
+        let left_collapsed_regions = self.left_collapsed_regions.clone();
+        let right_collapsed_regions = self.right_collapsed_regions.clone();
 
         let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct ConnectorCanvasData {
             curves: Vec<ConnectorCurve>,
+            left_collapsed_regions: Vec<CollapsedRegion>,
+            right_collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             left_scroll_pixels: f32,
             right_scroll_pixels: f32,
@@ -920,6 +963,8 @@ impl DiffViewer {
 
                 ConnectorCanvasData {
                     curves,
+                    left_collapsed_regions: left_collapsed_regions.clone(),
+                    right_collapsed_regions: right_collapsed_regions.clone(),
                     line_height,
                     left_scroll_pixels,
                     right_scroll_pixels,
@@ -945,6 +990,18 @@ impl DiffViewer {
 
                 let left_offset = data.left_top_origin - f32::from(bounds.origin.y);
                 let right_offset = data.right_top_origin - f32::from(bounds.origin.y);
+
+                let calc_collapsed_offset = |regions: &[CollapsedRegion], base_row: f32| -> f32 {
+                    let mut offset: f32 = 0.0;
+                    for region in regions {
+                        if region.end_line as f32 <= base_row {
+                            let lines_hidden = (region.end_line - region.start_line) as f32;
+                            let visual_height = 1.0;
+                            offset += lines_hidden - visual_height;
+                        }
+                    }
+                    offset
+                };
 
                 let minimal_block_height = 2.0;
                 let mut inserted_lines_above = 0usize;
@@ -981,33 +1038,48 @@ impl DiffViewer {
                         }
                     }
 
-                    let left_row = if is_left_empty {
+                    let base_left_row = if is_left_empty {
                         curve.focus_line as f32 + left_offset_rows
                     } else {
                         curve.left_start as f32
                     };
+                    let left_collapsed_offset =
+                        calc_collapsed_offset(&data.left_collapsed_regions, base_left_row);
+                    let left_row = base_left_row - left_collapsed_offset;
 
-                    let right_row = if is_right_empty {
+                    let base_right_row = if is_right_empty {
                         curve.focus_line as f32 + right_offset_rows
                     } else {
                         curve.right_start as f32
                     };
+                    let right_collapsed_offset =
+                        calc_collapsed_offset(&data.right_collapsed_regions, base_right_row);
+                    let right_row = base_right_row - right_collapsed_offset;
 
                     let left_y = (left_row * data.line_height) - data.left_scroll_pixels;
                     let right_y = (right_row * data.line_height) - data.right_scroll_pixels;
 
+                    let base_left_end = curve.left_end as f32 + 1.0;
+                    let left_end_collapsed_offset =
+                        calc_collapsed_offset(&data.left_collapsed_regions, base_left_end);
+                    let adjusted_left_end = base_left_end - left_end_collapsed_offset;
+
+                    let base_right_end = curve.right_end as f32 + 1.0;
+                    let right_end_collapsed_offset =
+                        calc_collapsed_offset(&data.right_collapsed_regions, base_right_end);
+                    let adjusted_right_end = base_right_end - right_end_collapsed_offset;
+
                     let left_bottom = if is_left_empty {
                         left_y + minimal_block_height
                     } else {
-                        ((curve.left_end as f32 + 1.0) * data.line_height - data.left_scroll_pixels)
+                        (adjusted_left_end * data.line_height - data.left_scroll_pixels)
                             .max(left_y + minimal_block_height)
                     };
 
                     let right_bottom = if is_right_empty {
                         right_y + minimal_block_height
                     } else {
-                        ((curve.right_end as f32 + 1.0) * data.line_height
-                            - data.right_scroll_pixels)
+                        (adjusted_right_end * data.line_height - data.right_scroll_pixels)
                             .max(right_y + minimal_block_height)
                     };
 
@@ -1317,6 +1389,13 @@ impl DiffViewer {
             });
         }
 
+        // Check if all regions are now expanded - if so, update the button state
+        if self.left_collapsed_regions.is_empty() && self.right_collapsed_regions.is_empty() {
+            if self.collapse_unchanged_enabled {
+                self.set_collapse_unchanged(false, cx);
+            }
+        }
+
         cx.notify();
     }
 
@@ -1541,6 +1620,18 @@ impl DiffViewer {
                 (line_height, scroll_pixels)
             });
 
+        let calc_collapsed_offset = |regions: &[CollapsedRegion], base_row: f32| -> f32 {
+            let mut offset: f32 = 0.0;
+            for region in regions {
+                if region.end_line as f32 <= base_row {
+                    let lines_hidden = (region.end_line - region.start_line) as f32;
+                    let visual_height = 1.0;
+                    offset += lines_hidden - visual_height;
+                }
+            }
+            offset
+        };
+
         for (index, curve) in self.connector_curves.iter().enumerate() {
             let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
             let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
@@ -1566,19 +1657,27 @@ impl DiffViewer {
                 0.0
             };
 
-            let left_row = if is_left_empty {
+            let base_left_row = if is_left_empty {
                 curve.focus_line as f32 + left_offset_rows
             } else {
                 curve.left_start as f32
             };
+            let left_collapsed_offset =
+                calc_collapsed_offset(&self.left_collapsed_regions, base_left_row);
+            let left_row = base_left_row - left_collapsed_offset;
 
             let left_y = (left_row * current_line_height) - current_scroll_pixels;
+
+            let base_left_end = curve.left_end as f32 + 1.0;
+            let left_end_collapsed_offset =
+                calc_collapsed_offset(&self.left_collapsed_regions, base_left_end);
+            let adjusted_left_end = base_left_end - left_end_collapsed_offset;
 
             let minimal_block_height = 4.0;
             let left_bottom = if is_left_empty {
                 left_y + minimal_block_height
             } else {
-                ((curve.left_end as f32 + 1.0) * current_line_height - current_scroll_pixels)
+                (adjusted_left_end * current_line_height - current_scroll_pixels)
                     .max(left_y + minimal_block_height)
             };
 
@@ -1672,9 +1771,22 @@ impl DiffViewer {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.collapse_unchanged_enabled = !self.collapse_unchanged_enabled;
+        self.set_collapse_unchanged(!self.collapse_unchanged_enabled, cx);
+    }
+
+    fn set_collapse_unchanged(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.collapse_unchanged_enabled = enabled;
         self.expanded_region_ids.clear();
         self.collapsed_blocks_need_update = true;
+
+        let fs = self.fs.clone();
+        update_settings_file(fs, cx, move |settings, _| {
+            settings
+                .git_split_diff
+                .get_or_insert_with(Default::default)
+                .collapse_unchanged = Some(enabled);
+        });
+
         cx.notify();
     }
 }
@@ -1829,7 +1941,9 @@ impl Render for DiffViewer {
         let collapse_button = ui::IconButton::new("collapse-toggle", ui::IconName::ChevronDownUp)
             .shape(ui::IconButtonShape::Square)
             .icon_size(ui::IconSize::Small)
-            .toggle_state(!collapse_enabled)
+            .icon_color(ui::Color::Default)
+            .toggle_state(collapse_enabled)
+            .selected_style(ui::ButtonStyle::Filled)
             .tooltip(move |_window, _cx| {
                 let tooltip_text = if collapse_enabled {
                     "Expand unchanged fragments"
@@ -1839,10 +1953,7 @@ impl Render for DiffViewer {
                 Tooltip::text(tooltip_text)(_window, _cx)
             })
             .on_click(cx.listener(|this, _, _, cx| {
-                this.collapse_unchanged_enabled = !this.collapse_unchanged_enabled;
-                this.expanded_region_ids.clear();
-                this.collapsed_blocks_need_update = true;
-                cx.notify();
+                this.set_collapse_unchanged(!this.collapse_unchanged_enabled, cx);
             }));
 
         div()

@@ -21,6 +21,7 @@ pub struct SplitDiffSettings {
     pub word_wrap: bool,
     pub default_width: Pixels,
     pub default_height: Pixels,
+    pub collapse_unchanged: bool,
 }
 
 impl Default for SplitDiffSettings {
@@ -34,6 +35,7 @@ impl Default for SplitDiffSettings {
             word_wrap: false,
             default_width: px(800.0),
             default_height: px(600.0),
+            collapse_unchanged: true,
         }
     }
 }
@@ -63,10 +65,11 @@ impl Settings for SplitDiffSettings {
                 .and_then(|c| c.default_height)
                 .map(px)
                 .unwrap_or(px(600.0)),
+            collapse_unchanged: git_split_diff
+                .and_then(|c| c.collapse_unchanged)
+                .unwrap_or(true),
         }
     }
-
-
 }
 
 // TODO: Implement SettingsUi once the API is stable

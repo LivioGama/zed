@@ -656,8 +656,16 @@ impl ProjectDiff {
 
         let project = self.project.clone();
 
+        let Some(fs) = self
+            .workspace
+            .upgrade()
+            .map(|w| w.read(cx).app_state().fs.clone())
+        else {
+            return;
+        };
+
         let view = cx.new(|cx| {
-            let mut viewer = DiffViewer::new(None, None, window, cx);
+            let mut viewer = DiffViewer::new(None, None, fs, window, cx);
             viewer.initialize(window, cx);
             viewer
         });
