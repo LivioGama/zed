@@ -82,8 +82,19 @@ struct DiffModificationHighlight;
 #[derive(Clone)]
 struct CollapsedRegion {
     block_id: CustomBlockId,
+    region_id: u32,
     start_line: u32,
     end_line: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SyncedCollapsedRange {
+    region_id: u32,
+    left_start: u32,
+    left_end: u32,
+    right_start: u32,
+    right_end: u32,
+    line_count: usize,
 }
 
 pub struct DiffViewer {
@@ -114,6 +125,8 @@ pub struct DiffViewer {
     left_collapsed_regions: Vec<CollapsedRegion>,
     right_collapsed_regions: Vec<CollapsedRegion>,
     collapse_unchanged_enabled: bool,
+    expanded_region_ids: std::collections::HashSet<u32>,
+    collapsed_blocks_need_update: bool,
 }
 
 actions!(diff_viewer, [ToggleCollapseUnchanged]);
@@ -177,8 +190,9 @@ impl DiffViewer {
         multibuffer: &Entity<MultiBuffer>,
         start_line: u32,
         end_line: u32,
-        _line_count: usize,
-        is_left: bool,
+        line_count: usize,
+        _is_left: bool,
+        region_id: u32,
         cx: &Context<Self>,
     ) -> BlockProperties<Anchor> {
         let snapshot = multibuffer.read(cx).snapshot(cx);
@@ -187,82 +201,74 @@ impl DiffViewer {
         let end_col = snapshot.line_len(MultiBufferRow(end_row));
         let end_anchor = snapshot.anchor_after(Point::new(end_row, end_col));
 
-        let height = (self.line_height * COLLAPSED_REGION_HEIGHT_MULTIPLIER).max(20.0);
-
+        let height = (self.line_height * COLLAPSED_REGION_HEIGHT_MULTIPLIER).max(24.0);
         let viewer = cx.entity().downgrade();
+        let label_text: SharedString = format!("{} unchanged lines", line_count).into();
 
         BlockProperties {
             placement: BlockPlacement::Replace(start_anchor..=end_anchor),
             height: Some(height as u32),
-            style: BlockStyle::Fixed,
+            style: BlockStyle::Sticky,
             render: Arc::new(move |cx| {
                 let theme = cx.theme();
-                let bg_color = theme.colors().surface_background;
-                let border_color = theme.colors().border;
+                let border_color = theme.colors().border_variant;
+                let text_color = theme.colors().text_muted;
+                let hover_bg = theme.colors().ghost_element_hover;
+                let label = label_text.clone();
+                let gutter_width = cx.margins.gutter.width;
+                let line_height = cx.line_height;
 
-                let wavy_element = canvas(
-                    move |_bounds, _window, _cx| {},
-                    move |bounds, _data, window, _cx| {
-                        let width = f32::from(bounds.size.width);
-                        let height = f32::from(bounds.size.height);
-                        if width <= 0.0 || height <= 0.0 {
-                            return;
-                        }
-                        let mut builder = PathBuilder::fill();
-                        let amplitude = height / 4.0;
-                        let frequency = 20.0f32 / width;
-                        let mut x = 0.0;
-                        let step = 1.0;
-                        builder.move_to(point(px(0.0), px(height / 2.0)));
-                        while x <= width {
-                            let y_top = height / 2.0 + amplitude * (frequency * x).sin();
-                            builder.line_to(point(px(x), px(y_top)));
-                            x += step;
-                        }
-                        x = width;
-                        while x >= 0.0 {
-                            let y_bottom = height / 2.0 - amplitude * (frequency * x).sin();
-                            builder.line_to(point(px(x), px(y_bottom)));
-                            x -= step;
-                        }
-                        builder.close();
-                        if let Ok(path) = builder.build() {
-                            let background: Background = bg_color.into();
-                            window.paint_path(path, background);
-                        }
-                    },
-                )
-                .size_full();
-
-                let plus_button = div()
-                    .absolute()
-                    .left(px(-32.0))
-                    .top(px((height - 24.0) / 2.0))
-                    .child(
-                        ui::IconButton::new(
-                            (if is_left { "expand-left" } else { "expand-right" }, start_line),
-                            ui::IconName::Plus,
-                        )
-                        .icon_size(ui::IconSize::Small)
-                        .style(ui::ButtonStyle::Filled)
-                        .on_click({
-                            let viewer = viewer.clone();
-                            move |_event, _window, cx| {
-                                if let Some(viewer) = viewer.upgrade() {
-                                    viewer.update(cx, |viewer, cx| {
-                                        viewer.expand_collapsed_region(start_line, is_left, cx);
-                                    });
-                                }
-                            }
-                        }),
-                    );
-
-                div()
-                    .relative()
+                h_flex()
+                    .id(cx.block_id)
+                    .h(line_height)
                     .w_full()
-                    .h(px(height))
-                    .child(wavy_element)
-                    .child(plus_button)
+                    .pl(gutter_width)
+                    .relative()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(theme.colors().editor_background)
+                    .hover(|style| style.bg(hover_bg))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(gutter_width)
+                            .right_0()
+                            .top(line_height / 2.0 - px(0.5))
+                            .h(px(1.0))
+                            .bg(border_color),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_0p5()
+                            .bg(theme.colors().surface_background)
+                            .border_1()
+                            .border_color(border_color)
+                            .rounded_sm()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                ui::Icon::new(ui::IconName::ExpandVertical)
+                                    .size(ui::IconSize::Small)
+                                    .color(ui::Color::Muted),
+                            )
+                            .child(div().text_xs().text_color(text_color).child(label)),
+                    )
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click({
+                        let viewer = viewer.clone();
+                        move |_event, _window, cx| {
+                            if let Some(viewer) = viewer.upgrade() {
+                                viewer.update(cx, |viewer, cx| {
+                                    viewer.expand_collapsed_region_by_id(region_id, cx);
+                                });
+                            }
+                        }
+                    })
                     .into_any()
             }),
             priority: 0,
@@ -361,6 +367,8 @@ impl DiffViewer {
             left_collapsed_regions: Vec::new(),
             right_collapsed_regions: Vec::new(),
             collapse_unchanged_enabled: true,
+            expanded_region_ids: std::collections::HashSet::new(),
+            collapsed_blocks_need_update: true,
         };
 
         viewer
@@ -473,6 +481,8 @@ impl DiffViewer {
         self.right_scroll_offset = 0.0;
         self.left_scroll_rows = 0.0;
         self.right_scroll_rows = 0.0;
+        self.expanded_region_ids.clear();
+        self.collapsed_blocks_need_update = true;
 
         cx.notify();
     }
@@ -1281,37 +1291,40 @@ impl DiffViewer {
         }
     }
 
-    fn expand_collapsed_region(&mut self, start_line: u32, is_left: bool, cx: &mut Context<Self>) {
-        if is_left {
-            if let Some(idx) = self
-                .left_collapsed_regions
-                .iter()
-                .position(|r| r.start_line == start_line)
-            {
-                let region = self.left_collapsed_regions.remove(idx);
-                self.left_editor.update(cx, |editor, cx| {
-                    editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
-                });
-            }
-        } else {
-            if let Some(idx) = self
-                .right_collapsed_regions
-                .iter()
-                .position(|r| r.start_line == start_line)
-            {
-                let region = self.right_collapsed_regions.remove(idx);
-                self.right_editor.update(cx, |editor, cx| {
-                    editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
-                });
-            }
+    fn expand_collapsed_region_by_id(&mut self, region_id: u32, cx: &mut Context<Self>) {
+        self.expanded_region_ids.insert(region_id);
+
+        // Remove only the specific blocks being expanded, not all blocks
+        if let Some(idx) = self
+            .left_collapsed_regions
+            .iter()
+            .position(|r| r.region_id == region_id)
+        {
+            let region = self.left_collapsed_regions.remove(idx);
+            self.left_editor.update(cx, |editor, cx| {
+                editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
+            });
         }
+
+        if let Some(idx) = self
+            .right_collapsed_regions
+            .iter()
+            .position(|r| r.region_id == region_id)
+        {
+            let region = self.right_collapsed_regions.remove(idx);
+            self.right_editor.update(cx, |editor, cx| {
+                editor.remove_blocks(vec![region.block_id].into_iter().collect(), None, cx);
+            });
+        }
+
         cx.notify();
     }
 
     fn update_collapsed_blocks(&mut self, cx: &mut Context<Self>) {
-        if !self.collapse_unchanged_enabled {
+        if !self.collapsed_blocks_need_update {
             return;
         }
+        self.collapsed_blocks_need_update = false;
 
         let block_ids: Vec<_> = self
             .left_collapsed_regions
@@ -1337,144 +1350,162 @@ impl DiffViewer {
             self.right_collapsed_regions.clear();
         }
 
-        let Some(analysis) = &self.diff_analysis else {
+        if !self.collapse_unchanged_enabled {
+            return;
+        }
+
+        let Some(analysis) = self.diff_analysis.clone() else {
             return;
         };
 
-        // Collect changed line ranges separately for left and right
-        let mut left_changed_ranges = Vec::new();
-        let mut right_changed_ranges = Vec::new();
+        let synced_ranges = self.compute_synced_collapsed_ranges(&analysis);
+
+        for range in synced_ranges {
+            if self.expanded_region_ids.contains(&range.region_id) {
+                continue;
+            }
+
+            let left_block_props = self.create_collapsed_block_properties(
+                &self.left_multibuffer,
+                range.left_start,
+                range.left_end,
+                range.line_count,
+                true,
+                range.region_id,
+                cx,
+            );
+            let block_ids = self.left_editor.update(cx, |editor, cx| {
+                editor.insert_blocks([left_block_props], None, cx)
+            });
+            for block_id in block_ids {
+                self.left_collapsed_regions.push(CollapsedRegion {
+                    block_id,
+                    region_id: range.region_id,
+                    start_line: range.left_start,
+                    end_line: range.left_end,
+                });
+            }
+
+            let right_block_props = self.create_collapsed_block_properties(
+                &self.right_multibuffer,
+                range.right_start,
+                range.right_end,
+                range.line_count,
+                false,
+                range.region_id,
+                cx,
+            );
+            let block_ids = self.right_editor.update(cx, |editor, cx| {
+                editor.insert_blocks([right_block_props], None, cx)
+            });
+            for block_id in block_ids {
+                self.right_collapsed_regions.push(CollapsedRegion {
+                    block_id,
+                    region_id: range.region_id,
+                    start_line: range.right_start,
+                    end_line: range.right_end,
+                });
+            }
+        }
+    }
+
+    fn compute_synced_collapsed_ranges(
+        &self,
+        analysis: &ImaraDiffAnalysis,
+    ) -> Vec<SyncedCollapsedRange> {
+        let mut synced_ranges = Vec::new();
+
+        let mut left_pos: usize = 0;
+        let mut right_pos: usize = 0;
+
+        let mut unchanged_start_left: Option<usize> = Some(0);
+        let mut unchanged_start_right: Option<usize> = Some(0);
+
         for block in &analysis.blocks {
-            if !block.left_range.is_empty() {
-                left_changed_ranges.push(block.left_range.clone());
-            }
-            if !block.right_range.is_empty() {
-                right_changed_ranges.push(block.right_range.clone());
-            }
-        }
+            let left_change_start = block.left_range.start;
+            let right_change_start = block.right_range.start;
 
-        // Sort and merge overlapping ranges for left
-        left_changed_ranges.sort_by_key(|r| r.start);
-        let mut left_merged_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        for range in left_changed_ranges {
-            if let Some(last) = left_merged_ranges.last_mut() {
-                if last.end >= range.start {
-                    last.end = last.end.max(range.end);
-                } else {
-                    left_merged_ranges.push(range);
+            if let (Some(start_left), Some(start_right)) =
+                (unchanged_start_left, unchanged_start_right)
+            {
+                let left_unchanged_end = left_change_start;
+                let right_unchanged_end = right_change_start;
+
+                let left_len = left_unchanged_end.saturating_sub(start_left);
+                let right_len = right_unchanged_end.saturating_sub(start_right);
+                let min_len = left_len.min(right_len);
+
+                let min_length = 2 * CONTEXT_LINES + MINIMUM_COLLAPSE_THRESHOLD;
+                if min_len >= min_length {
+                    let collapse_left_start = start_left + CONTEXT_LINES;
+                    let collapse_left_end = left_unchanged_end.saturating_sub(CONTEXT_LINES);
+                    let collapse_right_start = start_right + CONTEXT_LINES;
+                    let collapse_right_end = right_unchanged_end.saturating_sub(CONTEXT_LINES);
+
+                    if collapse_left_end > collapse_left_start
+                        && collapse_right_end > collapse_right_start
+                    {
+                        let line_count = (collapse_left_end - collapse_left_start)
+                            .min(collapse_right_end - collapse_right_start);
+
+                        let region_id = collapse_left_start as u32;
+
+                        synced_ranges.push(SyncedCollapsedRange {
+                            region_id,
+                            left_start: collapse_left_start as u32,
+                            left_end: collapse_left_end as u32,
+                            right_start: collapse_right_start as u32,
+                            right_end: collapse_right_end as u32,
+                            line_count,
+                        });
+                    }
                 }
-            } else {
-                left_merged_ranges.push(range);
             }
+
+            left_pos = block.left_range.end.max(left_pos);
+            right_pos = block.right_range.end.max(right_pos);
+
+            unchanged_start_left = Some(left_pos);
+            unchanged_start_right = Some(right_pos);
         }
 
-        // Sort and merge overlapping ranges for right
-        right_changed_ranges.sort_by_key(|r| r.start);
-        let mut right_merged_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        for range in right_changed_ranges {
-            if let Some(last) = right_merged_ranges.last_mut() {
-                if last.end >= range.start {
-                    last.end = last.end.max(range.end);
-                } else {
-                    right_merged_ranges.push(range);
-                }
-            } else {
-                right_merged_ranges.push(range);
-            }
-        }
+        if let (Some(start_left), Some(start_right)) = (unchanged_start_left, unchanged_start_right)
+        {
+            let left_unchanged_end = self.left_total_lines;
+            let right_unchanged_end = self.right_total_lines;
 
-        // Find unchanged ranges on left
-        let mut left_unchanged_ranges = Vec::new();
-        let mut current_start = 0;
-        for range in &left_merged_ranges {
-            if current_start < range.start {
-                left_unchanged_ranges.push(current_start..range.start);
-            }
-            current_start = current_start.max(range.end);
-        }
-        if current_start < self.left_total_lines {
-            left_unchanged_ranges.push(current_start..self.left_total_lines);
-        }
+            let left_len = left_unchanged_end.saturating_sub(start_left);
+            let right_len = right_unchanged_end.saturating_sub(start_right);
+            let min_len = left_len.min(right_len);
 
-        // Find unchanged ranges on right
-        let mut right_unchanged_ranges = Vec::new();
-        let mut current_start = 0;
-        for range in &right_merged_ranges {
-            if current_start < range.start {
-                right_unchanged_ranges.push(current_start..range.start);
-            }
-            current_start = current_start.max(range.end);
-        }
-        if current_start < self.right_total_lines {
-            right_unchanged_ranges.push(current_start..self.right_total_lines);
-        }
+            let min_length = 2 * CONTEXT_LINES + MINIMUM_COLLAPSE_THRESHOLD;
+            if min_len >= min_length {
+                let collapse_left_start = start_left + CONTEXT_LINES;
+                let collapse_left_end = left_unchanged_end.saturating_sub(CONTEXT_LINES);
+                let collapse_right_start = start_right + CONTEXT_LINES;
+                let collapse_right_end = right_unchanged_end.saturating_sub(CONTEXT_LINES);
 
-        // Filter ranges that are long enough to collapse
-        let min_length = 2 * CONTEXT_LINES + MINIMUM_COLLAPSE_THRESHOLD;
-        let left_collapsible_ranges: Vec<_> = left_unchanged_ranges
-            .into_iter()
-            .filter(|r| r.end - r.start >= min_length)
-            .collect();
-        let right_collapsible_ranges: Vec<_> = right_unchanged_ranges
-            .into_iter()
-            .filter(|r| r.end - r.start >= min_length)
-            .collect();
+                if collapse_left_end > collapse_left_start
+                    && collapse_right_end > collapse_right_start
+                {
+                    let line_count = (collapse_left_end - collapse_left_start)
+                        .min(collapse_right_end - collapse_right_start);
 
-        // Insert collapsed blocks for left
-        for range in left_collapsible_ranges {
-            let collapse_start = range.start + CONTEXT_LINES;
-            let collapse_end = range.end.saturating_sub(CONTEXT_LINES);
+                    let region_id = collapse_left_start as u32;
 
-            if collapse_end > collapse_start {
-                let line_count = collapse_end - collapse_start;
-                let block_props = self.create_collapsed_block_properties(
-                    &self.left_multibuffer,
-                    collapse_start as u32,
-                    collapse_end as u32,
-                    line_count,
-                    true,
-                    cx,
-                );
-                let block_ids = self.left_editor.update(cx, |editor, cx| {
-                    editor.insert_blocks([block_props], None, cx)
-                });
-                for block_id in block_ids {
-                    self.left_collapsed_regions.push(CollapsedRegion {
-                        block_id,
-                        start_line: collapse_start as u32,
-                        end_line: collapse_end as u32,
+                    synced_ranges.push(SyncedCollapsedRange {
+                        region_id,
+                        left_start: collapse_left_start as u32,
+                        left_end: collapse_left_end as u32,
+                        right_start: collapse_right_start as u32,
+                        right_end: collapse_right_end as u32,
+                        line_count,
                     });
                 }
             }
         }
 
-        // Insert collapsed blocks for right
-        for range in right_collapsible_ranges {
-            let collapse_start = range.start + CONTEXT_LINES;
-            let collapse_end = range.end.saturating_sub(CONTEXT_LINES);
-
-            if collapse_end > collapse_start {
-                let line_count = collapse_end - collapse_start;
-                let block_props = self.create_collapsed_block_properties(
-                    &self.right_multibuffer,
-                    collapse_start as u32,
-                    collapse_end as u32,
-                    line_count,
-                    false,
-                    cx,
-                );
-                let block_ids = self.right_editor.update(cx, |editor, cx| {
-                    editor.insert_blocks([block_props], None, cx)
-                });
-                for block_id in block_ids {
-                    self.right_collapsed_regions.push(CollapsedRegion {
-                        block_id,
-                        start_line: collapse_start as u32,
-                        end_line: collapse_end as u32,
-                    });
-                }
-            }
-        }
+        synced_ranges
     }
 }
 
@@ -1642,6 +1673,8 @@ impl DiffViewer {
         cx: &mut Context<Self>,
     ) {
         self.collapse_unchanged_enabled = !self.collapse_unchanged_enabled;
+        self.expanded_region_ids.clear();
+        self.collapsed_blocks_need_update = true;
         cx.notify();
     }
 }
@@ -1793,23 +1826,22 @@ impl Render for DiffViewer {
         self.update_collapsed_blocks(cx);
 
         let collapse_enabled = self.collapse_unchanged_enabled;
-        let collapse_button = ui::Button::new("collapse-toggle", "Collapse Unchanged Fragments")
-            .style(ui::ButtonStyle::Subtle)
-            .icon(if collapse_enabled {
-                ui::IconName::ChevronDown
-            } else {
-                ui::IconName::ChevronUp
-            })
+        let collapse_button = ui::IconButton::new("collapse-toggle", ui::IconName::ChevronDownUp)
+            .shape(ui::IconButtonShape::Square)
+            .icon_size(ui::IconSize::Small)
+            .toggle_state(!collapse_enabled)
             .tooltip(move |_window, _cx| {
                 let tooltip_text = if collapse_enabled {
-                    "Disable collapsing of unchanged lines"
+                    "Expand unchanged fragments"
                 } else {
-                    "Enable collapsing of unchanged lines"
+                    "Collapse unchanged fragments"
                 };
                 Tooltip::text(tooltip_text)(_window, _cx)
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 this.collapse_unchanged_enabled = !this.collapse_unchanged_enabled;
+                this.expanded_region_ids.clear();
+                this.collapsed_blocks_need_update = true;
                 cx.notify();
             }));
 
