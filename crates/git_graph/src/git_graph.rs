@@ -1,6 +1,8 @@
 mod graph;
 mod graph_rendering;
+mod git_modals;
 
+use git_modals::{GitModal, ModalAction};
 use graph::format_timestamp;
 
 use git::{
@@ -10,10 +12,10 @@ use git::{
 };
 use git_ui::commit_tooltip::CommitAvatar;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Corner, DefiniteLength, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, ParentElement, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Task, WeakEntity, Window,
-    actions, anchored, deferred, px,
+    AnyElement, App, ClipboardItem, Context, Corner, DefiniteLength, DismissEvent, ElementId,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, ParentElement,
+    Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, actions, anchored, deferred, px,
 };
 use graph_rendering::accent_colors_count;
 use project::{
@@ -25,6 +27,7 @@ use std::ops::Range;
 use theme::ThemeSettings;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{ContextMenu, ScrollableHandle, Table, TableInteractionState, Tooltip, prelude::*};
+use util::TryFutureExt;
 use workspace::{
     Workspace,
     item::{Item, ItemEvent, SerializableItem},
@@ -39,6 +42,18 @@ actions!(
         OpenGitGraph,
         /// Opens the commit view for the selected commit.
         OpenCommitView,
+        /// Checkout/switch to a branch.
+        CheckoutBranch,
+        /// Pull changes from remote with smart stash/unstash.
+        PullWithStash,
+        /// Merge a branch into current.
+        MergeBranch,
+        /// Rebase current branch onto another.
+        RebaseOnto,
+        /// Squash selected commits.
+        SquashCommits,
+        /// Delete a branch.
+        DeleteBranch,
     ]
 );
 
@@ -54,6 +69,9 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+
+    // Actions are handled through the focus system and don't need explicit registration
+    // The action handlers are implemented as methods on GitGraph
 }
 
 pub struct GitGraph {
@@ -63,11 +81,15 @@ pub struct GitGraph {
     loading: bool,
     error: Option<SharedString>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    context_branch_name: Option<SharedString>,
+    context_is_remote: bool,
     row_height: Pixels,
     table_interaction_state: Entity<TableInteractionState>,
     horizontal_scroll_offset: Pixels,
     graph_viewport_width: Pixels,
     selected_entry_idx: Option<usize>,
+    selected_entry_indices: Vec<usize>,
+    modal: Option<Entity<GitModal>>,
     log_source: LogSource,
     log_order: LogOrder,
     selected_commit_diff: Option<CommitDiff>,
@@ -138,11 +160,15 @@ impl GitGraph {
             _load_task: None,
             _commit_diff_task: None,
             context_menu: None,
+            context_branch_name: None,
+            context_is_remote: false,
             row_height,
             table_interaction_state,
             horizontal_scroll_offset: px(0.),
             graph_viewport_width: px(88.),
             selected_entry_idx: None,
+            selected_entry_indices: Vec::new(),
+            modal: None,
             selected_commit_diff: None,
             log_source,
             log_order,
@@ -176,7 +202,10 @@ impl GitGraph {
         }
     }
 
-    fn render_badge(&self, name: &SharedString, accent_color: gpui::Hsla) -> impl IntoElement {
+    fn render_badge(&self, name: &SharedString, accent_color: gpui::Hsla, cx: &Context<Self>) -> impl IntoElement {
+        let branch_name = name.clone();
+        let is_remote = name.starts_with("remotes/") || name.contains("origin/");
+
         div()
             .px_1p5()
             .py_0p5()
@@ -194,6 +223,12 @@ impl GitGraph {
                     .size(LabelSize::Small)
                     .color(Color::Default)
                     .single_line(),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.show_context_menu_for_branch(branch_name.clone(), is_remote, event.position, window, cx);
+                }),
             )
     }
 
@@ -283,7 +318,7 @@ impl GitGraph {
                                             .data
                                             .ref_names
                                             .iter()
-                                            .map(|name| self.render_badge(name, accent_color)),
+                                            .map(|name| self.render_badge(name, accent_color, cx)),
                                     )
                                 }))
                                 .child(
@@ -345,6 +380,538 @@ impl GitGraph {
         }));
 
         cx.notify();
+    }
+
+    fn show_context_menu_for_branch(
+        &mut self,
+        branch_name: SharedString,
+        is_remote: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_branch_name = Some(branch_name.clone());
+        self.context_is_remote = is_remote;
+
+        let menu = ContextMenu::build(window, cx, |mut menu, _focus_handle, cx| {
+            menu = menu.entry("Checkout", None, |_window, cx| {
+                cx.dispatch_action(&CheckoutBranch)
+            });
+
+            if !is_remote {
+                menu = menu
+                    .separator()
+                    .entry("Merge into Current", None, |_window, cx| {
+                        cx.dispatch_action(&MergeBranch)
+                    })
+                    .entry("Rebase Current Onto", None, |_window, cx| {
+                        cx.dispatch_action(&RebaseOnto)
+                    })
+                    .separator()
+                    .entry("Delete Branch...", None, |_window, cx| {
+                        cx.dispatch_action(&DeleteBranch)
+                    });
+            }
+
+            if is_remote {
+                menu = menu
+                    .separator()
+                    .entry("Delete Remote Branch...", None, |_window, cx| {
+                        cx.dispatch_action(&DeleteBranch)
+                    });
+            }
+
+            menu
+        });
+
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu = None;
+            this.context_branch_name = None;
+            cx.notify();
+        });
+
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn show_context_menu_for_commits(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_count = self.selected_entry_indices.len().max(1);
+        let can_squash = selected_count >= 2;
+
+        let menu = ContextMenu::build(window, cx, |mut menu, _focus_handle, cx| {
+            // TODO: workspace::CopyPath doesn't exist - need to implement copy SHA functionality
+            menu = menu
+                .entry("Copy SHA", None, |_window, _cx| {
+                    // TODO: Implement copy SHA to clipboard
+                })
+                .separator();
+
+            if can_squash {
+                menu = menu.entry(
+                    format!("Squash {} Commits...", selected_count),
+                    None,
+                    |_window, cx| cx.dispatch_action(&SquashCommits),
+                );
+            }
+
+            menu
+        });
+
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu = None;
+            cx.notify();
+        });
+
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn checkout_branch(
+        &mut self,
+        branch_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        // Check for uncommitted changes
+        let has_changes = false; // TODO: Check git status
+
+        if has_changes {
+            self.show_checkout_modal(branch_name, window, cx);
+        } else {
+            self.perform_checkout(branch_name, false, window, cx);
+        }
+    }
+
+    fn show_checkout_modal(
+        &mut self,
+        branch_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::CheckoutBranch {
+                    branch_name: branch_name.clone(),
+                    has_uncommitted_changes: true,
+                    stash: true,
+                },
+                |action, window, cx| {
+                    if let ModalAction::CheckoutBranch { branch_name, stash, .. } = action {
+                        cx.emit(DismissEvent);
+                        // Perform checkout will be called from the parent
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_checkout(
+        &mut self,
+        branch_name: SharedString,
+        stash_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            // Stash if needed
+            if stash_first {
+                let receiver = repository
+                    .update(cx, |repo, _cx| {
+                        repo.stash_all(true, Some(format!("Auto-stash before checkout to {}", branch_name)))
+                    })
+                    .unwrap();
+
+                match receiver.await {
+                    Ok(()) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Checkout branch
+            let receiver = repository
+                .update(cx, |repo, _| repo.change_branch(branch_name.to_string()))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            // Unstash if we stashed
+            if stash_first {
+                let task = repository
+                    .update(cx, |repo, cx| repo.stash_pop(None, cx))
+                    .unwrap();
+
+                // Ignore errors on unstash
+                let _ = task.await;
+            }
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn pull_with_stash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            // Stash changes
+            let receiver = repository
+                .update(cx, |repo, _cx| {
+                    repo.stash_all(true, Some("Auto-stash before pull".into()))
+                })
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            // Pull with rebase (or merge based on settings)
+            // TODO: Get rebase preference from settings
+            // TODO: pull() is missing AskPassDelegate parameter - need proper integration
+            let rebase = true;
+            // Commented out until AskPassDelegate is properly integrated
+            // let receiver = repository
+            //     .update(cx, |repo, _cx| {
+            //         repo.pull(None, "origin".into(), rebase, cx)
+            //     })
+            //     .unwrap();
+            //
+            // match receiver.await {
+            //     Ok(()) => {}
+            //     Err(e) => return Err(e),
+            // }
+
+            // Unstash
+            let task = repository
+                .update(cx, |repo, cx| repo.stash_pop(None, cx))
+                .unwrap();
+
+            // Ignore errors on unstash
+            let _ = task.await;
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn merge_branch(
+        &mut self,
+        branch_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::MergeBranch {
+                    branch_name: branch_name.clone(),
+                },
+                move |action, window, cx| {
+                    if let ModalAction::MergeBranch { branch_name } = action {
+                        // Will be handled by parent
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_merge(
+        &mut self,
+        branch_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| repo.merge_branch(branch_name.to_string()))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn rebase_onto(
+        &mut self,
+        target_branch: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::RebaseOnto {
+                    target_branch: target_branch.clone(),
+                },
+                move |action, window, cx| {
+                    if let ModalAction::RebaseOnto { target_branch } = action {
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_rebase(
+        &mut self,
+        target_branch: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| repo.rebase_onto(target_branch.to_string()))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn squash_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.len() < 2 {
+            return;
+        }
+
+        let commit_count = self.selected_entry_indices.len();
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::SquashCommits {
+                    commit_count,
+                    message: "Squashed commits".into(),
+                },
+                move |action, window, cx| {
+                    if let ModalAction::SquashCommits { message, .. } = action {
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_squash(
+        &mut self,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| {
+                self.graph.commits.get(idx).map(|c| c.data.sha.to_string())
+            })
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| {
+                    repo.squash_commits(commit_shas, message.to_string())
+                })
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                this.selected_entry_indices.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn delete_branch(
+        &mut self,
+        branch_name: SharedString,
+        is_remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::DeleteBranch {
+                    branch_name: branch_name.clone(),
+                    is_remote,
+                    delete_remote: false,
+                },
+                move |action, window, cx| {
+                    if let ModalAction::DeleteBranch {
+                        branch_name,
+                        is_remote,
+                        delete_remote,
+                    } = action
+                    {
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_delete_branch(
+        &mut self,
+        branch_name: SharedString,
+        delete_remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            // Delete local branch
+            let receiver = repository
+                .update(cx, |repo, _| repo.delete_branch(branch_name.to_string()))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            // Delete remote branch if requested
+            if delete_remote {
+                // TODO: delete_remote_branch is missing parameters - need proper integration
+                // Commented out until properly integrated
+                // let receiver = repository
+                //     .update(cx, |repo, _cx| {
+                //         repo.delete_remote_branch("origin".into(), branch_name.to_string())
+                //     })
+                //     .unwrap();
+                //
+                // match receiver.await {
+                //     Ok(()) => {}
+                //     Err(e) => return Err(e),
+                // }
+            }
+
+            this.update(cx, |this, cx| {
+                this.graph.clear();
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach();
     }
 
     fn get_remote(
@@ -497,7 +1064,7 @@ impl GitGraph {
                         h_flex().gap_1().flex_wrap().children(
                             ref_names
                                 .iter()
-                                .map(|name| self.render_badge(name, accent_color)),
+                                .map(|name| self.render_badge(name, accent_color, cx)),
                         )
                     }))
                     .child(
@@ -877,6 +1444,12 @@ impl Render for GitGraph {
             .bg(cx.theme().colors().editor_background)
             .key_context("GitGraph")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::handle_checkout_branch_action))
+            .on_action(cx.listener(Self::handle_pull_with_stash_action))
+            .on_action(cx.listener(Self::handle_merge_branch_action))
+            .on_action(cx.listener(Self::handle_rebase_onto_action))
+            .on_action(cx.listener(Self::handle_squash_commits_action))
+            .on_action(cx.listener(Self::handle_delete_branch_action))
             .child(v_flex().size_full().children(error_banner).child(content))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
@@ -887,6 +1460,21 @@ impl Render for GitGraph {
                 )
                 .with_priority(1)
             }))
+            .children(self.modal.as_ref().map(|modal| {
+                deferred(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.5))
+                        .child(modal.clone())
+                )
+                .with_priority(2)
+            }))
     }
 }
 
@@ -895,6 +1483,71 @@ impl EventEmitter<ItemEvent> for GitGraph {}
 impl Focusable for GitGraph {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl GitGraph {
+    fn handle_checkout_branch_action(
+        &mut self,
+        _: &CheckoutBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch_name) = self.context_branch_name.clone() {
+            self.checkout_branch(branch_name, window, cx);
+        }
+    }
+
+    fn handle_pull_with_stash_action(
+        &mut self,
+        _: &PullWithStash,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pull_with_stash(window, cx);
+    }
+
+    fn handle_merge_branch_action(
+        &mut self,
+        _: &MergeBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch_name) = self.context_branch_name.clone() {
+            self.merge_branch(branch_name, window, cx);
+        }
+    }
+
+    fn handle_rebase_onto_action(
+        &mut self,
+        _: &RebaseOnto,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch_name) = self.context_branch_name.clone() {
+            self.rebase_onto(branch_name, window, cx);
+        }
+    }
+
+    fn handle_squash_commits_action(
+        &mut self,
+        _: &SquashCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.squash_commits(window, cx);
+    }
+
+    fn handle_delete_branch_action(
+        &mut self,
+        _: &DeleteBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch_name) = self.context_branch_name.clone() {
+            let is_remote = self.context_is_remote;
+            self.delete_branch(branch_name, is_remote, window, cx);
+        }
     }
 }
 

@@ -1981,17 +1981,20 @@ impl GitPanel {
 
         cx.spawn({
             async move |this, cx| {
-                let stash_task = active_repository
-                    .update(cx, |repo, cx| repo.stash_all(cx))
-                    .await;
-                this.update(cx, |this, cx| {
-                    stash_task
-                        .map_err(|e| {
+                let receiver = active_repository
+                    .update(cx, |repo, _cx| repo.stash_all(true, None))
+                    .unwrap();
+                match receiver.await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ = this.update(cx, |this, cx| {
                             this.show_error_toast("stash", e, cx);
-                        })
-                        .ok();
+                        });
+                    }
+                }
+                let _ = this.update(cx, |_this, cx| {
                     cx.notify();
-                })
+                });
             }
         })
         .detach();

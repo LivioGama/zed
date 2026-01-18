@@ -4701,12 +4701,6 @@ impl Repository {
         self.stage_or_unstage_entries(false, to_unstage, cx)
     }
 
-    pub fn stash_all(&mut self, cx: &mut Context<Self>) -> Task<anyhow::Result<()>> {
-        let to_stash = self.cached_status().map(|entry| entry.repo_path).collect();
-
-        self.stash_entries(to_stash, cx)
-    }
-
     pub fn stash_entries(
         &mut self,
         entries: Vec<RepoPath>,
@@ -5615,6 +5609,134 @@ impl Repository {
                             .await?;
 
                         Ok(())
+                    }
+                }
+            },
+        )
+    }
+
+    // TODO: Fix this function - incompatible with current codebase
+    // pub fn delete_remote_branch(
+    //     &mut self,
+    //     remote_name: String,
+    //     branch_name: String,
+    //     cx: &mut App,
+    // ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
+    //     let id = self.id;
+    //     let cx = cx.to_async();
+    //     self.send_job(
+    //         Some(format!("git push {remote_name} --delete {branch_name}").into()),
+    //         move |repo, _cx| async move {
+    //             match repo {
+    //                 RepositoryState::Local(LocalRepositoryState {
+    //                     backend,
+    //                     environment,
+    //                     ..
+    //                 }) => {
+    //                     backend
+    //                         .delete_remote_branch(remote_name, branch_name, environment.clone())
+    //                         .await
+    //                 }
+    //                 RepositoryState::Remote(_) => {
+    //                     anyhow::bail!(
+    //                         "Remote branch deletion not supported for remote repositories"
+    //                     )
+    //                 }
+    //             }
+    //         },
+    //     )
+    // }
+
+    pub fn merge_branch(&mut self, branch_name: String) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git merge {branch_name}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.merge_branch(branch_name, environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Merge not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn rebase_onto(&mut self, target_branch: String) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git rebase {target_branch}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .rebase_onto(target_branch, environment.clone())
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Rebase not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn squash_commits(
+        &mut self,
+        commit_shas: Vec<String>,
+        message: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git rebase -i (squash {} commits)", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .squash_commits(commit_shas, message, environment.clone())
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Squash not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn stash_all(
+        &mut self,
+        include_untracked: bool,
+        message: Option<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let message_display = message.as_deref().unwrap_or("changes");
+        self.send_job(
+            Some(format!("git stash push {}", message_display).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .stash_all(include_untracked, message, environment.clone())
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Stash not supported for remote repositories")
                     }
                 }
             },
