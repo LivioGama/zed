@@ -11620,7 +11620,7 @@ impl Editor {
 
         let original_text = diff
             .read(cx)
-            .base_text()
+            .base_text(cx)
             .as_rope()
             .slice(fragment_base_range);
 

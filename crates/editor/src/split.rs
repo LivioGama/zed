@@ -1,153 +1,25 @@
-use buffer_diff::DiffHunkStatusKind;
+use std::ops::Range;
+
+use buffer_diff::BufferDiff;
+use collections::HashMap;
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
-    Action, AppContext as _, Background, Entity, EventEmitter, Focusable, Hsla, NoAction,
-    PathBuilder, Pixels, Point as GpuiPoint, Subscription, WeakEntity, canvas, point, prelude::*,
-    px,
+    Action, AppContext as _, Entity, EventEmitter, Focusable, NoAction, Subscription, WeakEntity,
 };
-use multi_buffer::{MultiBuffer, MultiBufferFilterMode};
+use language::{Buffer, Capability};
+use multi_buffer::{Anchor, ExcerptId, ExcerptRange, ExpandExcerptDirection, MultiBuffer, PathKey};
 use project::Project;
-use std::ops::Range;
-use theme::ActiveTheme;
-use ui::{App, Context, IconButton, IconName, IconSize, Render, Tooltip, Window, div, prelude::*};
-use workspace::{Item, ItemHandle, Pane, PaneGroup, SplitDirection, Workspace};
+use rope::Point;
+use text::{Bias, OffsetRangeExt as _};
+use ui::{
+    App, Context, InteractiveElement as _, IntoElement as _, ParentElement as _, Render,
+    Styled as _, Window, div,
+};
+use workspace::{
+    ActivePaneDecorator, Item, ItemHandle, Pane, PaneGroup, SplitDirection, Workspace,
+};
 
 use crate::{Editor, EditorEvent};
-
-const BEZIER_SEGMENTS: usize = 48;
-const CONNECTOR_BASE_CONTROL_OFFSET_RATIO: f32 = 0.35;
-const CRUSHED_BLOCK_HEIGHT: f32 = 4.0;
-const CRUSHED_THICKNESS: f32 = 4.0;
-const DIFF_HIGHLIGHT_ALPHA: f32 = 0.18;
-const CONNECTOR_GUTTER_WIDTH: f32 = 48.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectorKind {
-    Modify,
-    Insert,
-    Delete,
-}
-
-#[derive(Debug, Clone)]
-struct ConnectorCurve {
-    left_start: usize,
-    left_end: usize,
-    right_start: usize,
-    right_end: usize,
-    kind: ConnectorKind,
-    left_crushed: bool,
-    right_crushed: bool,
-    block_index: usize,
-}
-
-struct DiffBlock {
-    left_range: Range<usize>,
-    right_range: Range<usize>,
-    kind: DiffHunkStatusKind,
-    index: usize,
-}
-
-#[derive(Clone)]
-struct ConnectorCanvasData {
-    curves: Vec<ConnectorCurve>,
-    line_height: f32,
-    left_scroll_pixels: f32,
-    right_scroll_pixels: f32,
-    left_top_origin: f32,
-    right_top_origin: f32,
-    created_bg: Hsla,
-    deleted_bg: Hsla,
-    modified_bg: Hsla,
-}
-
-fn build_connector_curves(blocks: &[DiffBlock]) -> Vec<ConnectorCurve> {
-    blocks
-        .iter()
-        .filter_map(|block| {
-            if block.left_range.is_empty() && block.right_range.is_empty() {
-                return None;
-            }
-
-            let kind = match block.kind {
-                DiffHunkStatusKind::Modified => ConnectorKind::Modify,
-                DiffHunkStatusKind::Added => ConnectorKind::Insert,
-                DiffHunkStatusKind::Deleted => ConnectorKind::Delete,
-            };
-
-            let left_crushed = block.left_range.is_empty();
-            let right_crushed = block.right_range.is_empty();
-
-            let left_start = block.left_range.start;
-            let left_end = if left_crushed {
-                left_start
-            } else {
-                block
-                    .left_range
-                    .end
-                    .saturating_sub(1)
-                    .max(block.left_range.start)
-            };
-
-            let right_start = block.right_range.start;
-            let right_end = if right_crushed {
-                right_start
-            } else {
-                block
-                    .right_range
-                    .end
-                    .saturating_sub(1)
-                    .max(block.right_range.start)
-            };
-
-            Some(ConnectorCurve {
-                left_start,
-                left_end,
-                right_start,
-                right_end,
-                kind,
-                left_crushed,
-                right_crushed,
-                block_index: block.index,
-            })
-        })
-        .collect()
-}
-
-fn get_diff_colors(cx: &App) -> (Hsla, Hsla, Hsla) {
-    let theme = cx.theme();
-    let mut deleted_bg = theme.status().deleted_background;
-    deleted_bg.a = DIFF_HIGHLIGHT_ALPHA;
-    let mut created_bg = theme.status().created_background;
-    created_bg.a = DIFF_HIGHLIGHT_ALPHA;
-    let mut modified_bg = theme.status().modified_background;
-    modified_bg.a = DIFF_HIGHLIGHT_ALPHA;
-    (deleted_bg, created_bg, modified_bg)
-}
-
-fn cubic_bezier(
-    p0: GpuiPoint<Pixels>,
-    p1: GpuiPoint<Pixels>,
-    p2: GpuiPoint<Pixels>,
-    p3: GpuiPoint<Pixels>,
-    t: f32,
-) -> GpuiPoint<Pixels> {
-    let u = 1.0 - t;
-    let tt = t * t;
-    let uu = u * u;
-    let uuu = uu * u;
-    let ttt = tt * t;
-
-    point(
-        px(uuu * f32::from(p0.x)
-            + 3.0 * uu * t * f32::from(p1.x)
-            + 3.0 * u * tt * f32::from(p2.x)
-            + ttt * f32::from(p3.x)),
-        px(uuu * f32::from(p0.y)
-            + 3.0 * uu * t * f32::from(p1.y)
-            + 3.0 * u * tt * f32::from(p2.y)
-            + ttt * f32::from(p3.y)),
-    )
-}
 
 struct SplitDiffFeatureFlag;
 
@@ -168,185 +40,22 @@ struct SplitDiff;
 struct UnsplitDiff;
 
 pub struct SplittableEditor {
+    primary_multibuffer: Entity<MultiBuffer>,
     primary_editor: Entity<Editor>,
     secondary: Option<SecondaryEditor>,
     panes: PaneGroup,
     workspace: WeakEntity<Workspace>,
-    is_syncing_scroll: bool,
-    pending_scroll_sync: Option<PendingScrollSync>,
-    /// Cached scroll correspondence segments for semantic scroll sync
-    scroll_correspondence: Vec<ScrollCorrespondenceSegment>,
     _subscriptions: Vec<Subscription>,
-}
-
-struct PendingScrollSync {
-    target_editor: Entity<Editor>,
-    source_scroll_row: f32,
-    from_primary: bool,
-}
-
-/// A segment representing a region of correspondence between the two panes.
-/// Unchanged regions have equal sizes; changed regions may have different sizes.
-#[derive(Debug, Clone)]
-struct ScrollCorrespondenceSegment {
-    left_start: f32,
-    left_end: f32,
-    right_start: f32,
-    right_end: f32,
 }
 
 struct SecondaryEditor {
+    multibuffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     pane: Entity<Pane>,
     has_latest_selection: bool,
+    primary_to_secondary: HashMap<ExcerptId, ExcerptId>,
+    secondary_to_primary: HashMap<ExcerptId, ExcerptId>,
     _subscriptions: Vec<Subscription>,
-}
-
-/// Builds a correspondence map from diff blocks.
-/// This maps regions between left and right panes, with unchanged regions
-/// having 1:1 correspondence and changed regions having proportional mapping.
-fn build_scroll_correspondence(diff_blocks: &[DiffBlock]) -> Vec<ScrollCorrespondenceSegment> {
-    let mut segments = Vec::new();
-    let mut left_cursor: f32 = 0.0;
-    let mut right_cursor: f32 = 0.0;
-
-    for block in diff_blocks {
-        let left_block_start = block.left_range.start as f32;
-        let right_block_start = block.right_range.start as f32;
-
-        // Add unchanged segment before this diff block (if any)
-        if left_block_start > left_cursor || right_block_start > right_cursor {
-            // The gap before this block is unchanged content
-            // Both sides should have the same gap size in unchanged regions
-            let left_gap = left_block_start - left_cursor;
-            let right_gap = right_block_start - right_cursor;
-
-            // Use the minimum gap to ensure we don't overshoot
-            // (they should be equal for truly unchanged content)
-            let gap = left_gap.min(right_gap);
-
-            if gap > 0.0 {
-                segments.push(ScrollCorrespondenceSegment {
-                    left_start: left_cursor,
-                    left_end: left_cursor + gap,
-                    right_start: right_cursor,
-                    right_end: right_cursor + gap,
-                });
-                left_cursor += gap;
-                right_cursor += gap;
-            }
-
-            // Handle any remaining gap on either side
-            if left_gap > gap {
-                let remaining = left_gap - gap;
-                segments.push(ScrollCorrespondenceSegment {
-                    left_start: left_cursor,
-                    left_end: left_cursor + remaining,
-                    right_start: right_cursor,
-                    right_end: right_cursor,
-                });
-                left_cursor += remaining;
-            }
-            if right_gap > gap {
-                let remaining = right_gap - gap;
-                segments.push(ScrollCorrespondenceSegment {
-                    left_start: left_cursor,
-                    left_end: left_cursor,
-                    right_start: right_cursor,
-                    right_end: right_cursor + remaining,
-                });
-                right_cursor += remaining;
-            }
-        }
-
-        // Add the diff block segment
-        let left_block_size = (block.left_range.end - block.left_range.start) as f32;
-        let right_block_size = (block.right_range.end - block.right_range.start) as f32;
-
-        if left_block_size > 0.0 || right_block_size > 0.0 {
-            segments.push(ScrollCorrespondenceSegment {
-                left_start: left_cursor,
-                left_end: left_cursor + left_block_size,
-                right_start: right_cursor,
-                right_end: right_cursor + right_block_size,
-            });
-            left_cursor += left_block_size;
-            right_cursor += right_block_size;
-        }
-    }
-
-    segments
-}
-
-/// Translates a scroll position from one pane to the corresponding position in the other.
-/// Uses proportional mapping within changed regions and 1:1 mapping in unchanged regions.
-fn translate_scroll_position(
-    source_row: f32,
-    from_left: bool,
-    segments: &[ScrollCorrespondenceSegment],
-    _source_total_rows: f32,
-    target_total_rows: f32,
-) -> f32 {
-    if segments.is_empty() {
-        // No diff blocks - direct 1:1 mapping
-        return source_row;
-    }
-
-    // Find the segment containing the source row
-    for segment in segments {
-        let (source_start, source_end, target_start, target_end) = if from_left {
-            (
-                segment.left_start,
-                segment.left_end,
-                segment.right_start,
-                segment.right_end,
-            )
-        } else {
-            (
-                segment.right_start,
-                segment.right_end,
-                segment.left_start,
-                segment.left_end,
-            )
-        };
-
-        if source_row >= source_start && source_row <= source_end {
-            let source_size = source_end - source_start;
-            let target_size = target_end - target_start;
-
-            if source_size <= 0.0 {
-                // Source segment is empty (crushed) - return target start
-                return target_start;
-            }
-
-            if target_size <= 0.0 {
-                // Target segment is empty (crushed) - return target start
-                return target_start;
-            }
-
-            // Proportional mapping within the segment
-            let progress = (source_row - source_start) / source_size;
-            return target_start + progress * target_size;
-        }
-    }
-
-    // Beyond all segments - extrapolate from the last segment
-    if let Some(last_segment) = segments.last() {
-        let (source_end, target_end) = if from_left {
-            (last_segment.left_end, last_segment.right_end)
-        } else {
-            (last_segment.right_end, last_segment.left_end)
-        };
-
-        let beyond = source_row - source_end;
-        let result = target_end + beyond;
-
-        // Clamp to valid range
-        return result.max(0.0).min(target_total_rows);
-    }
-
-    // Fallback - direct mapping
-    source_row.min(target_total_rows)
 }
 
 impl SplittableEditor {
@@ -365,14 +74,22 @@ impl SplittableEditor {
     }
 
     pub fn new_unsplit(
-        buffer: Entity<MultiBuffer>,
+        primary_multibuffer: Entity<MultiBuffer>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let primary_editor =
-            cx.new(|cx| Editor::for_multibuffer(buffer, Some(project.clone()), window, cx));
+        let primary_editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(
+                primary_multibuffer.clone(),
+                Some(project.clone()),
+                window,
+                cx,
+            );
+            editor.set_expand_all_diff_hunks(cx);
+            editor
+        });
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(
                 workspace.downgrade(),
@@ -390,17 +107,25 @@ impl SplittableEditor {
         });
         let panes = PaneGroup::new(pane);
         // TODO(split-diff) we might want to tag editor events with whether they came from primary/secondary
-        let subscriptions =
-            vec![
-                cx.subscribe(&primary_editor, |this, _, event: &EditorEvent, cx| {
-                    if let EditorEvent::SelectionsChanged { .. } = event
-                        && let Some(secondary) = &mut this.secondary
-                    {
+        let subscriptions = vec![cx.subscribe(
+            &primary_editor,
+            |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::ExpandExcerptsRequested {
+                    excerpt_ids,
+                    lines,
+                    direction,
+                } => {
+                    this.expand_excerpts(excerpt_ids.iter().copied(), *lines, *direction, cx);
+                }
+                EditorEvent::SelectionsChanged { .. } => {
+                    if let Some(secondary) = &mut this.secondary {
                         secondary.has_latest_selection = false;
                     }
-                    cx.emit(event.clone())
-                }),
-            ];
+                    cx.emit(event.clone());
+                }
+                _ => cx.emit(event.clone()),
+            },
+        )];
 
         window.defer(cx, {
             let workspace = workspace.downgrade();
@@ -417,12 +142,10 @@ impl SplittableEditor {
         });
         Self {
             primary_editor,
+            primary_multibuffer,
             secondary: None,
             panes,
             workspace: workspace.downgrade(),
-            is_syncing_scroll: false,
-            pending_scroll_sync: None,
-            scroll_correspondence: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -438,42 +161,22 @@ impl SplittableEditor {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        let follower = self.primary_editor.update(cx, |primary, cx| {
-            primary.buffer().update(cx, |buffer, cx| {
-                let follower = buffer.get_or_create_follower(cx);
-                buffer.set_filter_mode(Some(MultiBufferFilterMode::KeepInsertions));
-                follower
-            })
+
+        let secondary_multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer
         });
-        follower.update(cx, |follower, _| {
-            follower.set_filter_mode(Some(MultiBufferFilterMode::KeepDeletions));
-        });
-        let secondary_editor = workspace.update(cx, |workspace, cx| {
-            cx.new(|cx| {
-                let mut editor = Editor::for_multibuffer(follower, Some(project), window, cx);
-                // TODO(split-diff) this should be at the multibuffer level
-                editor.set_use_base_text_line_numbers(true, cx);
-                editor.added_to_workspace(workspace, window, cx);
-                // Unfold all content for the split diff view
-                let snapshot = editor.buffer().read(cx).snapshot(cx);
-                editor.unfold_ranges(
-                    &[multi_buffer::MultiBufferOffset(0)..snapshot.len()],
-                    true,
-                    false,
-                    cx,
-                );
-                editor
-            })
-        });
-        // Unfold all content in primary editor too
-        self.primary_editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            editor.unfold_ranges(
-                &[multi_buffer::MultiBufferOffset(0)..snapshot.len()],
-                true,
-                false,
+        let secondary_editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(
+                secondary_multibuffer.clone(),
+                Some(project.clone()),
+                window,
                 cx,
             );
+            editor.number_deleted_lines = true;
+            editor.set_delegate_expand_excerpts(true);
+            editor
         });
         let secondary_pane = cx.new(|cx| {
             let mut pane = Pane::new(
@@ -498,40 +201,59 @@ impl SplittableEditor {
             pane
         });
 
-        let subscriptions = vec![
-            cx.subscribe(&secondary_editor, |this, _, event: &EditorEvent, cx| {
-                if let EditorEvent::SelectionsChanged { .. } = event
-                    && let Some(secondary) = &mut this.secondary
-                {
-                    secondary.has_latest_selection = true;
-                }
-                cx.emit(event.clone())
-            }),
-            // Sync scroll from secondary (left) to primary (right)
-            cx.subscribe(
-                &secondary_editor,
-                |this, editor, event: &EditorEvent, cx| {
-                    if let EditorEvent::ScrollPositionChanged { .. } = event {
-                        this.sync_scroll_from_editor(editor.clone(), false, cx);
+        let subscriptions = vec![cx.subscribe(
+            &secondary_editor,
+            |this, _, event: &EditorEvent, cx| match event {
+                EditorEvent::ExpandExcerptsRequested {
+                    excerpt_ids,
+                    lines,
+                    direction,
+                } => {
+                    if let Some(secondary) = &this.secondary {
+                        let primary_ids: Vec<_> = excerpt_ids
+                            .iter()
+                            .filter_map(|id| secondary.secondary_to_primary.get(id).copied())
+                            .collect();
+                        this.expand_excerpts(primary_ids.into_iter(), *lines, *direction, cx);
                     }
-                },
-            ),
-        ];
-        // Add scroll sync subscription from primary to secondary
-        self._subscriptions.push(cx.subscribe(
-            &self.primary_editor,
-            |this, editor, event: &EditorEvent, cx| {
-                if let EditorEvent::ScrollPositionChanged { .. } = event {
-                    this.sync_scroll_from_editor(editor.clone(), true, cx);
                 }
+                EditorEvent::SelectionsChanged { .. } => {
+                    if let Some(secondary) = &mut this.secondary {
+                        secondary.has_latest_selection = true;
+                    }
+                    cx.emit(event.clone());
+                }
+                _ => cx.emit(event.clone()),
             },
-        ));
-        self.secondary = Some(SecondaryEditor {
+        )];
+        let mut secondary = SecondaryEditor {
             editor: secondary_editor,
+            multibuffer: secondary_multibuffer,
             pane: secondary_pane.clone(),
             has_latest_selection: false,
+            primary_to_secondary: HashMap::default(),
+            secondary_to_primary: HashMap::default(),
             _subscriptions: subscriptions,
+        };
+        self.primary_editor.update(cx, |editor, cx| {
+            editor.set_delegate_expand_excerpts(true);
+            editor.buffer().update(cx, |primary_multibuffer, cx| {
+                primary_multibuffer.set_show_deleted_hunks(false, cx);
+                let paths = primary_multibuffer.paths().cloned().collect::<Vec<_>>();
+                for path in paths {
+                    let Some(excerpt_id) = primary_multibuffer.excerpts_for_path(&path).next()
+                    else {
+                        continue;
+                    };
+                    let snapshot = primary_multibuffer.snapshot(cx);
+                    let buffer = snapshot.buffer_for_excerpt(excerpt_id).unwrap();
+                    let diff = primary_multibuffer.diff_for(buffer.remote_id()).unwrap();
+                    secondary.sync_path_excerpts(path.clone(), primary_multibuffer, diff, cx);
+                }
+            })
         });
+        self.secondary = Some(secondary);
+
         let primary_pane = self.panes.first_pane();
         self.panes
             .split(&primary_pane, &secondary_pane, SplitDirection::Left, cx)
@@ -545,101 +267,12 @@ impl SplittableEditor {
         };
         self.panes.remove(&secondary.pane, cx).unwrap();
         self.primary_editor.update(cx, |primary, cx| {
-            primary.buffer().update(cx, |buffer, _| {
-                buffer.set_filter_mode(None);
+            primary.set_delegate_expand_excerpts(false);
+            primary.buffer().update(cx, |buffer, cx| {
+                buffer.set_show_deleted_hunks(true, cx);
             });
         });
         cx.notify();
-    }
-
-    fn sync_scroll_from_editor(
-        &mut self,
-        source_editor: Entity<Editor>,
-        from_primary: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_syncing_scroll {
-            return;
-        }
-        let Some(secondary) = &self.secondary else {
-            return;
-        };
-
-        // Get scroll row from source editor (Y component is the row)
-        let source_scroll_row =
-            source_editor.update(cx, |editor, cx| editor.scroll_position(cx).y as f32);
-
-        let target_editor = if from_primary {
-            secondary.editor.clone()
-        } else {
-            self.primary_editor.clone()
-        };
-
-        // Store pending scroll sync to be applied during render when we have window access
-        // The actual translation will happen in apply_pending_scroll_sync using the correspondence map
-        self.pending_scroll_sync = Some(PendingScrollSync {
-            target_editor,
-            source_scroll_row,
-            from_primary,
-        });
-        cx.notify();
-    }
-
-    fn apply_pending_scroll_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_scroll_sync.take() else {
-            return;
-        };
-
-        // Get total rows for both editors to clamp the result
-        let (source_total_rows, target_total_rows) = if pending.from_primary {
-            let primary_rows = self.primary_editor.update(cx, |editor, cx| {
-                editor.buffer().read(cx).snapshot(cx).max_point().row as f32
-            });
-            let secondary_rows = self
-                .secondary
-                .as_ref()
-                .map(|s| {
-                    s.editor.update(cx, |editor, cx| {
-                        editor.buffer().read(cx).snapshot(cx).max_point().row as f32
-                    })
-                })
-                .unwrap_or(primary_rows);
-            (primary_rows, secondary_rows)
-        } else {
-            let secondary_rows = self
-                .secondary
-                .as_ref()
-                .map(|s| {
-                    s.editor.update(cx, |editor, cx| {
-                        editor.buffer().read(cx).snapshot(cx).max_point().row as f32
-                    })
-                })
-                .unwrap_or(0.0);
-            let primary_rows = self.primary_editor.update(cx, |editor, cx| {
-                editor.buffer().read(cx).snapshot(cx).max_point().row as f32
-            });
-            (secondary_rows, primary_rows)
-        };
-
-        // Translate the scroll position using semantic correspondence
-        // from_primary means source is right (primary), target is left (secondary)
-        // So from_left for translation is the opposite of from_primary
-        let from_left = !pending.from_primary;
-        let target_scroll_row = translate_scroll_position(
-            pending.source_scroll_row,
-            from_left,
-            &self.scroll_correspondence,
-            source_total_rows,
-            target_total_rows,
-        );
-
-        self.is_syncing_scroll = true;
-        pending.target_editor.update(cx, |editor, cx| {
-            let mut scroll_position = editor.scroll_position(cx);
-            scroll_position.y = crate::scroll::ScrollOffset::from(target_scroll_row);
-            editor.set_scroll_position(scroll_position, window, cx);
-        });
-        self.is_syncing_scroll = false;
     }
 
     pub fn added_to_workspace(
@@ -659,536 +292,302 @@ impl SplittableEditor {
         }
     }
 
-    fn build_diff_blocks(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<DiffBlock> {
-        let Some(secondary) = &self.secondary else {
-            return Vec::new();
-        };
-
-        let mut diff_blocks = Vec::new();
-
-        // Get display snapshots to convert buffer rows to display rows
-        // This accounts for excerpt headers and other display-level transformations
-        let (primary_hunks, primary_display) = self.primary_editor.update(cx, |editor, cx| {
-            let buffer = editor.buffer().read(cx);
-            let buffer_snapshot = buffer.snapshot(cx);
-            let hunks: Vec<_> = buffer_snapshot.diff_hunks().collect();
-            let display_snapshot = editor.snapshot(window, cx).display_snapshot;
-            (hunks, display_snapshot)
-        });
-
-        let (secondary_hunks, secondary_display) = secondary.editor.update(cx, |editor, cx| {
-            let buffer = editor.buffer().read(cx);
-            let buffer_snapshot = buffer.snapshot(cx);
-            let hunks: Vec<_> = buffer_snapshot.diff_hunks().collect();
-            let display_snapshot = editor.snapshot(window, cx).display_snapshot;
-            (hunks, display_snapshot)
-        });
-
-        for (index, (primary_hunk, secondary_hunk)) in
-            primary_hunks.iter().zip(secondary_hunks.iter()).enumerate()
-        {
-            let status = primary_hunk.status();
-            let kind = status.kind;
-
-            // Convert buffer rows to display rows
-            let right_start_point = crate::MultiBufferPoint::new(primary_hunk.row_range.start.0, 0);
-            let right_end_point = crate::MultiBufferPoint::new(primary_hunk.row_range.end.0, 0);
-            let left_start_point =
-                crate::MultiBufferPoint::new(secondary_hunk.row_range.start.0, 0);
-            let left_end_point = crate::MultiBufferPoint::new(secondary_hunk.row_range.end.0, 0);
-
-            let right_start = primary_display
-                .point_to_display_point(right_start_point, text::Bias::Left)
-                .row()
-                .0 as usize;
-            let right_end = primary_display
-                .point_to_display_point(right_end_point, text::Bias::Left)
-                .row()
-                .0 as usize;
-            let left_start = secondary_display
-                .point_to_display_point(left_start_point, text::Bias::Left)
-                .row()
-                .0 as usize;
-            let left_end = secondary_display
-                .point_to_display_point(left_end_point, text::Bias::Left)
-                .row()
-                .0 as usize;
-
-            diff_blocks.push(DiffBlock {
-                left_range: left_start..left_end,
-                right_range: right_start..right_end,
-                kind,
-                index,
-            });
-        }
-
-        diff_blocks
-    }
-
-    fn render_revert_buttons(
+    pub fn set_excerpts_for_path(
         &mut self,
-        diff_blocks: &[DiffBlock],
-        window: &mut Window,
+        path: PathKey,
+        buffer: Entity<Buffer>,
+        ranges: impl IntoIterator<Item = Range<Point>> + Clone,
+        context_line_count: u32,
+        diff: Entity<BufferDiff>,
         cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
-        let Some(secondary) = &self.secondary else {
-            return Vec::new();
-        };
-
-        let curves = build_connector_curves(diff_blocks);
-
-        let secondary_editor = secondary.editor.clone();
-
-        // Get scroll and line height info - we need to match the connector drawing logic
-        // The connectors calculate: left_offset = left_top_origin - gutter_origin_y
-        // Then position at: (row * line_height) - scroll_pixels + left_offset
-        // For buttons in a relative div, we use the same offset calculation
-        let (line_height, left_scroll_pixels, left_editor_origin_y) =
-            secondary.editor.update(cx, |editor, cx| {
-                let line_height = f32::from(
-                    editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size()),
+    ) -> (Vec<Range<Anchor>>, bool) {
+        self.primary_multibuffer
+            .update(cx, |primary_multibuffer, cx| {
+                let (anchors, added_a_new_excerpt) = primary_multibuffer.set_excerpts_for_path(
+                    path.clone(),
+                    buffer.clone(),
+                    ranges,
+                    context_line_count,
+                    cx,
                 );
-                let scroll_rows = editor.scroll_position(cx).y;
-                let scroll_pixels = (scroll_rows as f32) * line_height;
-                let origin_y = editor
-                    .last_bounds()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(0.0);
-                (line_height, scroll_pixels, origin_y)
-            });
-
-        let (right_scroll_pixels, right_editor_origin_y) =
-            self.primary_editor.update(cx, |editor, cx| {
-                let line_height = f32::from(
-                    editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size()),
-                );
-                let scroll_rows = editor.scroll_position(cx).y;
-                let scroll_pixels = (scroll_rows as f32) * line_height;
-                let origin_y = editor
-                    .last_bounds()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(0.0);
-                (scroll_pixels, origin_y)
-            });
-
-        // The gutter div starts at the same Y as the editors (approximately)
-        // We use the average editor origin as the gutter origin estimate
-        let gutter_origin_y = (left_editor_origin_y + right_editor_origin_y) / 2.0;
-        let left_offset = left_editor_origin_y - gutter_origin_y;
-        let right_offset = right_editor_origin_y - gutter_origin_y;
-
-        let mut buttons = Vec::new();
-
-        for curve in curves.iter() {
-            // Calculate the Y position for the button based on the connector center
-            // This matches exactly how draw_connectors calculates positions
-            let left_row = curve.left_start as f32;
-            let right_row = curve.right_start as f32;
-
-            let left_top = (left_row * line_height) - left_scroll_pixels + left_offset;
-            let right_top = (right_row * line_height) - right_scroll_pixels + right_offset;
-
-            let left_bottom = if curve.left_crushed {
-                left_top + CRUSHED_BLOCK_HEIGHT
-            } else {
-                ((curve.left_end as f32 + 1.0) * line_height - left_scroll_pixels + left_offset)
-                    .max(left_top + CRUSHED_BLOCK_HEIGHT)
-            };
-
-            let _right_bottom = if curve.right_crushed {
-                right_top + CRUSHED_BLOCK_HEIGHT
-            } else {
-                ((curve.right_end as f32 + 1.0) * line_height - right_scroll_pixels + right_offset)
-                    .max(right_top + CRUSHED_BLOCK_HEIGHT)
-            };
-
-            // Position button at the vertical center of the left side of the connector
-            let left_center = (left_top + left_bottom) / 2.0;
-
-            let button_size = 16.0;
-            let button_top = left_center - button_size / 2.0;
-
-            // Skip if button would be off-screen (using a reasonable viewport estimate)
-            if button_top + button_size < 0.0 || button_top > 2000.0 {
-                continue;
-            }
-
-            let block_index = curve.block_index;
-            let secondary_editor_clone = secondary_editor.clone();
-
-            let button = div()
-                .id(("revert-btn", block_index))
-                .absolute()
-                .top(px(button_top))
-                .left(px(-button_size - 4.0))
-                .child(
-                    IconButton::new(("revert", block_index), IconName::ArrowRight)
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Revert this change"))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.revert_hunk(block_index, &secondary_editor_clone, window, cx);
-                        })),
-                )
-                .into_any_element();
-
-            buttons.push(button);
-        }
-
-        buttons
-    }
-
-    fn revert_hunk(
-        &mut self,
-        block_index: usize,
-        _secondary_editor: &Entity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Get the hunk at the given index from the primary editor
-        let hunks = self.primary_editor.update(cx, |editor, cx| {
-            let buffer = editor.buffer().read(cx);
-            let snapshot = buffer.snapshot(cx);
-            snapshot.diff_hunks().collect::<Vec<_>>()
-        });
-
-        let Some(hunk) = hunks.get(block_index) else {
-            return;
-        };
-
-        // Use the existing prepare_restore_change mechanism
-        let mut revert_changes = std::collections::HashMap::default();
-        self.primary_editor.update(cx, |editor, cx| {
-            editor.prepare_restore_change(&mut revert_changes, hunk, cx);
-        });
-
-        if !revert_changes.is_empty() {
-            self.primary_editor.update(cx, |editor, cx| {
-                editor.transact(window, cx, |editor, window, cx| {
-                    editor.restore(revert_changes, window, cx);
-                });
-            });
-        }
-    }
-
-    fn render_crushed_lines(
-        &self,
-        diff_blocks: &[DiffBlock],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (Vec<gpui::AnyElement>, Vec<gpui::AnyElement>) {
-        let Some(secondary) = &self.secondary else {
-            return (Vec::new(), Vec::new());
-        };
-
-        let curves = build_connector_curves(diff_blocks);
-        let (deleted_bg, created_bg, _modified_bg) = get_diff_colors(cx);
-
-        // Get layout info from left editor
-        let (line_height, left_scroll_pixels, left_editor_origin_y) =
-            secondary.editor.update(cx, |editor, cx| {
-                let line_height = f32::from(
-                    editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size()),
-                );
-                let scroll_rows = editor.scroll_position(cx).y;
-                let scroll_pixels = (scroll_rows as f32) * line_height;
-                let origin_y = editor
-                    .last_bounds()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(0.0);
-                (line_height, scroll_pixels, origin_y)
-            });
-
-        let (right_scroll_pixels, right_editor_origin_y) =
-            self.primary_editor.update(cx, |editor, cx| {
-                let line_height = f32::from(
-                    editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size()),
-                );
-                let scroll_rows = editor.scroll_position(cx).y;
-                let scroll_pixels = (scroll_rows as f32) * line_height;
-                let origin_y = editor
-                    .last_bounds()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(0.0);
-                (scroll_pixels, origin_y)
-            });
-
-        // Calculate offsets similar to connector drawing
-        let gutter_origin_y = (left_editor_origin_y + right_editor_origin_y) / 2.0;
-        let left_offset = left_editor_origin_y - gutter_origin_y;
-        let right_offset = right_editor_origin_y - gutter_origin_y;
-
-        let mut left_lines = Vec::new();
-        let mut right_lines = Vec::new();
-
-        for curve in curves.iter() {
-            if !curve.left_crushed && !curve.right_crushed {
-                continue;
-            }
-
-            let left_row = curve.left_start as f32;
-            let right_row = curve.right_start as f32;
-
-            let left_top = (left_row * line_height) - left_scroll_pixels + left_offset;
-            let right_top = (right_row * line_height) - right_scroll_pixels + right_offset;
-
-            if curve.left_crushed {
-                // Left side is empty (insertion on right) - draw line on left pane
-                let y_pos = left_top + CRUSHED_BLOCK_HEIGHT / 2.0 - CRUSHED_THICKNESS / 2.0;
-                let line = div()
-                    .id(("crushed-left", curve.block_index))
-                    .absolute()
-                    .top(px(y_pos))
-                    .left_0()
-                    .right_0()
-                    .h(px(CRUSHED_THICKNESS))
-                    .bg(created_bg)
-                    .into_any_element();
-                left_lines.push(line);
-            }
-
-            if curve.right_crushed {
-                // Right side is empty (deletion on left) - draw line on right pane
-                let y_pos = right_top + CRUSHED_BLOCK_HEIGHT / 2.0 - CRUSHED_THICKNESS / 2.0;
-                let line = div()
-                    .id(("crushed-right", curve.block_index))
-                    .absolute()
-                    .top(px(y_pos))
-                    .left_0()
-                    .right_0()
-                    .h(px(CRUSHED_THICKNESS))
-                    .bg(deleted_bg)
-                    .into_any_element();
-                right_lines.push(line);
-            }
-        }
-
-        (left_lines, right_lines)
-    }
-
-    fn render_connector_overlay(&self, diff_blocks: &[DiffBlock], cx: &App) -> impl IntoElement {
-        let left_editor = self.secondary.as_ref().unwrap().editor.clone();
-        let right_editor = self.primary_editor.clone();
-        let curves = build_connector_curves(diff_blocks);
-        let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
-
-        canvas(
-            move |bounds, window, cx| {
-                let (left_line_height, left_scroll_pixels, left_bounds) =
-                    left_editor.update(cx, |editor, cx| {
-                        let line_height = f32::from(
-                            editor
-                                .style(cx)
-                                .text
-                                .line_height_in_pixels(window.rem_size()),
-                        );
-                        let scroll_rows = editor.scroll_position(cx).y;
-                        let scroll_pixels = (scroll_rows as f32) * line_height;
-                        let bounds = editor.last_bounds().cloned();
-                        (line_height, scroll_pixels, bounds)
-                    });
-
-                let (right_scroll_pixels, right_bounds) = right_editor.update(cx, |editor, cx| {
-                    let line_height = f32::from(
-                        editor
-                            .style(cx)
-                            .text
-                            .line_height_in_pixels(window.rem_size()),
-                    );
-                    let scroll_rows = editor.scroll_position(cx).y;
-                    let scroll_pixels = (scroll_rows as f32) * line_height;
-                    let bounds = editor.last_bounds().cloned();
-                    (scroll_pixels, bounds)
-                });
-
-                let left_top_origin = left_bounds
-                    .as_ref()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(f32::from(bounds.origin.y));
-                let right_top_origin = right_bounds
-                    .as_ref()
-                    .map(|b| f32::from(b.origin.y))
-                    .unwrap_or(f32::from(bounds.origin.y));
-
-                ConnectorCanvasData {
-                    curves,
-                    line_height: left_line_height,
-                    left_scroll_pixels,
-                    right_scroll_pixels,
-                    left_top_origin,
-                    right_top_origin,
-                    created_bg,
-                    deleted_bg,
-                    modified_bg,
+                if !anchors.is_empty()
+                    && primary_multibuffer
+                        .diff_for(buffer.read(cx).remote_id())
+                        .is_none_or(|old_diff| old_diff.entity_id() != diff.entity_id())
+                {
+                    primary_multibuffer.add_diff(diff.clone(), cx);
                 }
-            },
-            move |bounds, data, window, _cx| {
-                Self::draw_connectors(&bounds, &data, window);
-            },
-        )
-        .size_full()
+                if let Some(secondary) = &mut self.secondary {
+                    secondary.sync_path_excerpts(path, primary_multibuffer, diff, cx);
+                }
+                (anchors, added_a_new_excerpt)
+            })
     }
 
-    fn draw_connectors(
-        bounds: &gpui::Bounds<Pixels>,
-        data: &ConnectorCanvasData,
-        window: &mut Window,
+    fn expand_excerpts(
+        &mut self,
+        excerpt_ids: impl Iterator<Item = ExcerptId> + Clone,
+        lines: u32,
+        direction: ExpandExcerptDirection,
+        cx: &mut Context<Self>,
     ) {
-        if data.curves.is_empty() {
+        let mut corresponding_paths = HashMap::default();
+        self.primary_multibuffer.update(cx, |multibuffer, cx| {
+            let snapshot = multibuffer.snapshot(cx);
+            if self.secondary.is_some() {
+                corresponding_paths = excerpt_ids
+                    .clone()
+                    .map(|excerpt_id| {
+                        let path = multibuffer.path_for_excerpt(excerpt_id).unwrap();
+                        let buffer = snapshot.buffer_for_excerpt(excerpt_id).unwrap();
+                        let diff = multibuffer.diff_for(buffer.remote_id()).unwrap();
+                        (path, diff)
+                    })
+                    .collect::<HashMap<_, _>>();
+            }
+            multibuffer.expand_excerpts(excerpt_ids.clone(), lines, direction, cx);
+        });
+
+        if let Some(secondary) = &mut self.secondary {
+            self.primary_multibuffer.update(cx, |multibuffer, cx| {
+                for (path, diff) in corresponding_paths {
+                    secondary.sync_path_excerpts(path, multibuffer, diff, cx);
+                }
+            })
+        }
+    }
+
+    pub fn remove_excerpts_for_path(&mut self, path: PathKey, cx: &mut Context<Self>) {
+        self.primary_multibuffer.update(cx, |buffer, cx| {
+            buffer.remove_excerpts_for_path(path.clone(), cx)
+        });
+        if let Some(secondary) = &mut self.secondary {
+            secondary.remove_mappings_for_path(&path, cx);
+            secondary
+                .multibuffer
+                .update(cx, |buffer, cx| buffer.remove_excerpts_for_path(path, cx))
+        }
+    }
+}
+
+#[cfg(test)]
+impl SplittableEditor {
+    fn check_invariants(&self, quiesced: bool, cx: &App) {
+        use buffer_diff::DiffHunkStatusKind;
+        use collections::HashSet;
+        use multi_buffer::MultiBufferOffset;
+        use multi_buffer::MultiBufferRow;
+        use multi_buffer::MultiBufferSnapshot;
+
+        fn format_diff(snapshot: &MultiBufferSnapshot) -> String {
+            let text = snapshot.text();
+            let row_infos = snapshot.row_infos(MultiBufferRow(0)).collect::<Vec<_>>();
+            let boundary_rows = snapshot
+                .excerpt_boundaries_in_range(MultiBufferOffset(0)..)
+                .map(|b| b.row)
+                .collect::<HashSet<_>>();
+
+            text.split('\n')
+                .enumerate()
+                .zip(row_infos)
+                .map(|((ix, line), info)| {
+                    let marker = match info.diff_status.map(|status| status.kind) {
+                        Some(DiffHunkStatusKind::Added) => "+ ",
+                        Some(DiffHunkStatusKind::Deleted) => "- ",
+                        Some(DiffHunkStatusKind::Modified) => unreachable!(),
+                        None => {
+                            if !line.is_empty() {
+                                "  "
+                            } else {
+                                ""
+                            }
+                        }
+                    };
+                    let boundary_row = if boundary_rows.contains(&MultiBufferRow(ix as u32)) {
+                        "  ----------\n"
+                    } else {
+                        ""
+                    };
+                    let expand = info
+                        .expand_info
+                        .map(|expand_info| match expand_info.direction {
+                            ExpandExcerptDirection::Up => " [↑]",
+                            ExpandExcerptDirection::Down => " [↓]",
+                            ExpandExcerptDirection::UpAndDown => " [↕]",
+                        })
+                        .unwrap_or_default();
+
+                    format!("{boundary_row}{marker}{line}{expand}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let Some(secondary) = &self.secondary else {
             return;
+        };
+
+        log::info!(
+            "primary:\n\n{}",
+            format_diff(&self.primary_multibuffer.read(cx).snapshot(cx))
+        );
+
+        log::info!(
+            "secondary:\n\n{}",
+            format_diff(&secondary.multibuffer.read(cx).snapshot(cx))
+        );
+
+        let primary_excerpts = self.primary_multibuffer.read(cx).excerpt_ids();
+        let secondary_excerpts = secondary.multibuffer.read(cx).excerpt_ids();
+        assert_eq!(primary_excerpts.len(), secondary_excerpts.len());
+
+        assert_eq!(
+            secondary.primary_to_secondary.len(),
+            primary_excerpts.len(),
+            "primary_to_secondary mapping count should match excerpt count"
+        );
+        assert_eq!(
+            secondary.secondary_to_primary.len(),
+            secondary_excerpts.len(),
+            "secondary_to_primary mapping count should match excerpt count"
+        );
+
+        for primary_id in &primary_excerpts {
+            assert!(
+                secondary.primary_to_secondary.contains_key(primary_id),
+                "primary excerpt {:?} should have a mapping to secondary",
+                primary_id
+            );
+        }
+        for secondary_id in &secondary_excerpts {
+            assert!(
+                secondary.secondary_to_primary.contains_key(secondary_id),
+                "secondary excerpt {:?} should have a mapping to primary",
+                secondary_id
+            );
         }
 
-        let gutter_width = f32::from(bounds.size.width);
-        let gutter_height = f32::from(bounds.size.height);
-        let gutter_origin_y = f32::from(bounds.origin.y);
-        let minimal_block_height = CRUSHED_BLOCK_HEIGHT;
+        for (primary_id, secondary_id) in &secondary.primary_to_secondary {
+            assert_eq!(
+                secondary.secondary_to_primary.get(secondary_id),
+                Some(primary_id),
+                "mappings should be bijective"
+            );
+        }
 
-        // Calculate how far down from the gutter top the editor content starts
-        // This accounts for any header/toolbar above the editor content
-        let left_offset = data.left_top_origin - gutter_origin_y;
-        let right_offset = data.right_top_origin - gutter_origin_y;
+        if quiesced {
+            let primary_snapshot = self.primary_multibuffer.read(cx).snapshot(cx);
+            let secondary_snapshot = secondary.multibuffer.read(cx).snapshot(cx);
+            let primary_diff_hunks = primary_snapshot
+                .diff_hunks()
+                .map(|hunk| hunk.diff_base_byte_range)
+                .collect::<Vec<_>>();
+            let secondary_diff_hunks = secondary_snapshot
+                .diff_hunks()
+                .map(|hunk| hunk.diff_base_byte_range)
+                .collect::<Vec<_>>();
+            pretty_assertions::assert_eq!(primary_diff_hunks, secondary_diff_hunks);
 
-        for curve in &data.curves {
-            let left_row = curve.left_start as f32;
-            let right_row = curve.right_start as f32;
-
-            // Position relative to editor content, then add offset from gutter top
-            let left_top = (left_row * data.line_height) - data.left_scroll_pixels + left_offset;
-            let right_top =
-                (right_row * data.line_height) - data.right_scroll_pixels + right_offset;
-
-            let left_bottom = if curve.left_crushed {
-                left_top + minimal_block_height
-            } else {
-                ((curve.left_end as f32 + 1.0) * data.line_height - data.left_scroll_pixels
-                    + left_offset)
-                    .max(left_top + minimal_block_height)
-            };
-
-            let right_bottom = if curve.right_crushed {
-                right_top + minimal_block_height
-            } else {
-                ((curve.right_end as f32 + 1.0) * data.line_height - data.right_scroll_pixels
-                    + right_offset)
-                    .max(right_top + minimal_block_height)
-            };
-
-            let connector_height = (left_bottom - left_top).max(right_bottom - right_top);
-            let base_control_offset = gutter_width * CONNECTOR_BASE_CONTROL_OFFSET_RATIO;
-            let reference_line_height = data.line_height.max(1.0);
-            let control_offset = if connector_height < reference_line_height * 2.0 {
-                base_control_offset * (connector_height / (reference_line_height * 2.0)).max(0.3)
-            } else {
-                base_control_offset
-            };
-
-            let connector_top_y = left_top.min(right_top);
-            let connector_bottom_y = left_bottom.max(right_bottom);
-
-            let base_color = match curve.kind {
-                ConnectorKind::Insert => data.created_bg,
-                ConnectorKind::Delete => data.deleted_bg,
-                ConnectorKind::Modify => data.modified_bg,
-            };
-
-            let is_visible = connector_bottom_y >= 0.0 && connector_top_y <= gutter_height;
-
-            if is_visible {
-                Self::draw_connector_ribbon(
-                    window,
-                    bounds,
-                    left_top,
-                    left_bottom,
-                    right_top,
-                    right_bottom,
-                    control_offset,
-                    base_color,
-                );
-            }
+            // Filtering out empty lines is a bit of a hack, to work around a case where
+            // the base text has a trailing newline but the current text doesn't, or vice versa.
+            // In this case, we get the additional newline on one side, but that line is not
+            // marked as added/deleted by rowinfos.
+            let primary_unmodified_rows = primary_snapshot
+                .text()
+                .split("\n")
+                .zip(primary_snapshot.row_infos(MultiBufferRow(0)))
+                .filter(|(line, row_info)| !line.is_empty() && row_info.diff_status.is_none())
+                .map(|(line, _)| line.to_owned())
+                .collect::<Vec<_>>();
+            let secondary_unmodified_rows = secondary_snapshot
+                .text()
+                .split("\n")
+                .zip(secondary_snapshot.row_infos(MultiBufferRow(0)))
+                .filter(|(line, row_info)| !line.is_empty() && row_info.diff_status.is_none())
+                .map(|(line, _)| line.to_owned())
+                .collect::<Vec<_>>();
+            pretty_assertions::assert_eq!(primary_unmodified_rows, secondary_unmodified_rows);
         }
     }
 
-    fn draw_connector_ribbon(
-        window: &mut Window,
-        bounds: &gpui::Bounds<Pixels>,
-        left_top: f32,
-        left_bottom: f32,
-        right_top: f32,
-        right_bottom: f32,
-        control_offset: f32,
-        color: Hsla,
+    fn randomly_edit_excerpts(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        mutation_count: usize,
+        cx: &mut Context<Self>,
     ) {
-        let segments = BEZIER_SEGMENTS;
-        let mut builder = PathBuilder::fill();
+        use collections::HashSet;
+        use rand::prelude::*;
+        use std::env;
+        use util::RandomCharIter;
 
-        for i in 0..=segments {
-            let t = i as f32 / segments as f32;
-            let top_point = cubic_bezier(
-                point(
-                    px(f32::from(bounds.origin.x)),
-                    px(f32::from(bounds.origin.y) + left_top),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + control_offset),
-                    px(f32::from(bounds.origin.y) + left_top),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + f32::from(bounds.size.width) - control_offset),
-                    px(f32::from(bounds.origin.y) + right_top),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + f32::from(bounds.size.width)),
-                    px(f32::from(bounds.origin.y) + right_top),
-                ),
-                t,
-            );
-            if i == 0 {
-                builder.move_to(top_point);
-            } else {
-                builder.line_to(top_point);
+        let max_excerpts = env::var("MAX_EXCERPTS")
+            .map(|i| i.parse().expect("invalid `MAX_EXCERPTS` variable"))
+            .unwrap_or(5);
+
+        for _ in 0..mutation_count {
+            let paths = self
+                .primary_multibuffer
+                .read(cx)
+                .paths()
+                .cloned()
+                .collect::<Vec<_>>();
+            let excerpt_ids = self.primary_multibuffer.read(cx).excerpt_ids();
+
+            if rng.random_bool(0.1) && !excerpt_ids.is_empty() {
+                let mut excerpts = HashSet::default();
+                for _ in 0..rng.random_range(0..excerpt_ids.len()) {
+                    excerpts.extend(excerpt_ids.choose(rng).copied());
+                }
+
+                let line_count = rng.random_range(0..5);
+
+                log::info!("Expanding excerpts {excerpts:?} by {line_count} lines");
+
+                self.expand_excerpts(
+                    excerpts.iter().cloned(),
+                    line_count,
+                    ExpandExcerptDirection::UpAndDown,
+                    cx,
+                );
+                continue;
             }
-        }
 
-        for i in (0..=segments).rev() {
-            let t = i as f32 / segments as f32;
-            let bottom_point = cubic_bezier(
-                point(
-                    px(f32::from(bounds.origin.x)),
-                    px(f32::from(bounds.origin.y) + left_bottom),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + control_offset),
-                    px(f32::from(bounds.origin.y) + left_bottom),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + f32::from(bounds.size.width) - control_offset),
-                    px(f32::from(bounds.origin.y) + right_bottom),
-                ),
-                point(
-                    px(f32::from(bounds.origin.x) + f32::from(bounds.size.width)),
-                    px(f32::from(bounds.origin.y) + right_bottom),
-                ),
-                t,
-            );
-            builder.line_to(bottom_point);
-        }
-
-        if let Ok(path) = builder.build() {
-            window.with_content_mask(Some(gpui::ContentMask { bounds: *bounds }), |window| {
-                let background: Background = color.into();
-                window.paint_path(path, background);
-            });
+            if excerpt_ids.is_empty() || (rng.random() && excerpt_ids.len() < max_excerpts) {
+                let len = rng.random_range(100..500);
+                let text = RandomCharIter::new(&mut *rng).take(len).collect::<String>();
+                let buffer = cx.new(|cx| Buffer::local(text, cx));
+                log::info!(
+                    "Creating new buffer {} with text: {:?}",
+                    buffer.read(cx).remote_id(),
+                    buffer.read(cx).text()
+                );
+                let buffer_snapshot = buffer.read(cx).snapshot();
+                let diff = cx.new(|cx| BufferDiff::new_unchanged(&buffer_snapshot, cx));
+                // Create some initial diff hunks.
+                buffer.update(cx, |buffer, cx| {
+                    buffer.randomly_edit(rng, 1, cx);
+                });
+                let buffer_snapshot = buffer.read(cx).text_snapshot();
+                let ranges = diff.update(cx, |diff, cx| {
+                    diff.recalculate_diff_sync(&buffer_snapshot, cx);
+                    diff.snapshot(cx)
+                        .hunks(&buffer_snapshot)
+                        .map(|hunk| hunk.buffer_range.to_point(&buffer_snapshot))
+                        .collect::<Vec<_>>()
+                });
+                let path = PathKey::for_buffer(&buffer, cx);
+                self.set_excerpts_for_path(path, buffer, ranges, 2, diff, cx);
+            } else {
+                let remove_count = rng.random_range(1..=paths.len());
+                let paths_to_remove = paths
+                    .choose_multiple(rng, remove_count)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for path in paths_to_remove {
+                    self.remove_excerpts_for_path(path.clone(), cx);
+                }
+            }
         }
     }
 }
@@ -1206,78 +605,252 @@ impl Render for SplittableEditor {
         window: &mut ui::Window,
         cx: &mut ui::Context<Self>,
     ) -> impl ui::IntoElement {
-        // Apply any pending scroll sync now that we have window access
-        self.apply_pending_scroll_sync(window, cx);
-
-        let has_secondary = self.secondary.is_some();
-
-        // Get values that need cx before render_connector_overlay borrows it
-        let split_listener = cx.listener(Self::split);
-        let unsplit_listener = cx.listener(Self::unsplit);
-        let surface_bg = cx.theme().colors().surface_background;
-
-        if !has_secondary {
-            return div()
-                .id("splittable-editor")
-                .on_action(split_listener)
-                .on_action(unsplit_listener)
-                .size_full()
-                .child(self.primary_editor.clone())
-                .into_any_element();
-        }
-
-        let secondary_editor = self.secondary.as_ref().unwrap().editor.clone();
-        let primary_editor = self.primary_editor.clone();
-
-        // Build diff blocks once and use for both connectors, buttons, and scroll correspondence
-        let diff_blocks = self.build_diff_blocks(window, cx);
-
-        // Update scroll correspondence map for semantic scroll synchronization
-        self.scroll_correspondence = build_scroll_correspondence(&diff_blocks);
-
-        // Render buttons first (needs &mut self)
-        let revert_buttons = self.render_revert_buttons(&diff_blocks, window, cx);
-
-        // Render crushed line overlays for left and right panes
-        let (left_crushed_lines, right_crushed_lines) =
-            self.render_crushed_lines(&diff_blocks, window, cx);
-
-        // Render connector overlay (only needs &self) - convert to AnyElement to end borrow
-        let connector_overlay = self
-            .render_connector_overlay(&diff_blocks, cx)
-            .into_any_element();
-
+        let inner = if self.secondary.is_none() {
+            self.primary_editor.clone().into_any_element()
+        } else if let Some(active) = self.panes.panes().into_iter().next() {
+            self.panes
+                .render(
+                    None,
+                    &ActivePaneDecorator::new(active, &self.workspace),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         div()
             .id("splittable-editor")
-            .on_action(split_listener)
-            .on_action(unsplit_listener)
+            .on_action(cx.listener(Self::split))
+            .on_action(cx.listener(Self::unsplit))
             .size_full()
-            .flex()
-            .flex_row()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .relative()
-                    .child(secondary_editor)
-                    .children(left_crushed_lines),
-            )
-            .child(
-                div()
-                    .w(px(CONNECTOR_GUTTER_WIDTH))
-                    .bg(surface_bg)
-                    .relative()
-                    .child(connector_overlay)
-                    .children(revert_buttons),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .relative()
-                    .child(primary_editor)
-                    .children(right_crushed_lines),
-            )
-            .into_any_element()
+            .child(inner)
+    }
+}
+
+impl SecondaryEditor {
+    fn sync_path_excerpts(
+        &mut self,
+        path_key: PathKey,
+        primary_multibuffer: &mut MultiBuffer,
+        diff: Entity<BufferDiff>,
+        cx: &mut App,
+    ) {
+        let Some(excerpt_id) = primary_multibuffer.excerpts_for_path(&path_key).next() else {
+            self.remove_mappings_for_path(&path_key, cx);
+            self.multibuffer.update(cx, |multibuffer, cx| {
+                multibuffer.remove_excerpts_for_path(path_key, cx);
+            });
+            return;
+        };
+
+        let primary_excerpt_ids: Vec<ExcerptId> =
+            primary_multibuffer.excerpts_for_path(&path_key).collect();
+
+        let primary_multibuffer_snapshot = primary_multibuffer.snapshot(cx);
+        let main_buffer = primary_multibuffer_snapshot
+            .buffer_for_excerpt(excerpt_id)
+            .unwrap();
+        let base_text_buffer = diff.read(cx).base_text_buffer();
+        let diff_snapshot = diff.read(cx).snapshot(cx);
+        let base_text_buffer_snapshot = base_text_buffer.read(cx).snapshot();
+        let new = primary_multibuffer
+            .excerpts_for_buffer(main_buffer.remote_id(), cx)
+            .into_iter()
+            .map(|(_, excerpt_range)| {
+                let point_range_to_base_text_point_range = |range: Range<Point>| {
+                    let start_row = diff_snapshot.row_to_base_text_row(
+                        range.start.row,
+                        Bias::Left,
+                        main_buffer,
+                    );
+                    let end_row =
+                        diff_snapshot.row_to_base_text_row(range.end.row, Bias::Right, main_buffer);
+                    let end_column = diff_snapshot.base_text().line_len(end_row);
+                    Point::new(start_row, 0)..Point::new(end_row, end_column)
+                };
+                let primary = excerpt_range.primary.to_point(main_buffer);
+                let context = excerpt_range.context.to_point(main_buffer);
+                ExcerptRange {
+                    primary: point_range_to_base_text_point_range(primary),
+                    context: point_range_to_base_text_point_range(context),
+                }
+            })
+            .collect();
+
+        let main_buffer = primary_multibuffer.buffer(main_buffer.remote_id()).unwrap();
+
+        self.remove_mappings_for_path(&path_key, cx);
+
+        self.editor.update(cx, |editor, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                let (ids, _) = buffer.update_path_excerpts(
+                    path_key.clone(),
+                    base_text_buffer.clone(),
+                    &base_text_buffer_snapshot,
+                    new,
+                    cx,
+                );
+                if !ids.is_empty()
+                    && buffer
+                        .diff_for(base_text_buffer.read(cx).remote_id())
+                        .is_none_or(|old_diff| old_diff.entity_id() != diff.entity_id())
+                {
+                    buffer.add_inverted_diff(diff, main_buffer, cx);
+                }
+            })
+        });
+
+        let secondary_excerpt_ids: Vec<ExcerptId> = self
+            .multibuffer
+            .read(cx)
+            .excerpts_for_path(&path_key)
+            .collect();
+
+        for (primary_id, secondary_id) in primary_excerpt_ids.into_iter().zip(secondary_excerpt_ids)
+        {
+            self.primary_to_secondary.insert(primary_id, secondary_id);
+            self.secondary_to_primary.insert(secondary_id, primary_id);
+        }
+    }
+
+    fn remove_mappings_for_path(&mut self, path_key: &PathKey, cx: &App) {
+        let secondary_excerpt_ids: Vec<ExcerptId> = self
+            .multibuffer
+            .read(cx)
+            .excerpts_for_path(path_key)
+            .collect();
+
+        for secondary_id in secondary_excerpt_ids {
+            if let Some(primary_id) = self.secondary_to_primary.remove(&secondary_id) {
+                self.primary_to_secondary.remove(&primary_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fs::FakeFs;
+    use gpui::AppContext as _;
+    use language::Capability;
+    use multi_buffer::{MultiBuffer, PathKey};
+    use project::Project;
+    use rand::rngs::StdRng;
+    use settings::SettingsStore;
+    use ui::VisualContext as _;
+    use workspace::Workspace;
+
+    use crate::SplittableEditor;
+
+    fn init_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            crate::init(cx);
+        });
+    }
+
+    #[ignore]
+    #[gpui::test(iterations = 100)]
+    async fn test_random_split_editor(mut rng: StdRng, cx: &mut gpui::TestAppContext) {
+        use rand::prelude::*;
+
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let primary_multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer
+        });
+        let editor = cx.new_window_entity(|window, cx| {
+            let mut editor =
+                SplittableEditor::new_unsplit(primary_multibuffer, project, workspace, window, cx);
+            editor.split(&Default::default(), window, cx);
+            editor
+        });
+
+        let operations = std::env::var("OPERATIONS")
+            .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
+            .unwrap_or(20);
+        let rng = &mut rng;
+        for _ in 0..operations {
+            editor.update(cx, |editor, cx| {
+                let buffers = editor
+                    .primary_editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .all_buffers();
+
+                if buffers.is_empty() {
+                    editor.randomly_edit_excerpts(rng, 2, cx);
+                    editor.check_invariants(true, cx);
+                    return;
+                }
+
+                let quiesced = match rng.random_range(0..100) {
+                    0..=69 if !buffers.is_empty() => {
+                        let buffer = buffers.iter().choose(rng).unwrap();
+                        buffer.update(cx, |buffer, cx| {
+                            if rng.random() {
+                                log::info!("randomly editing single buffer");
+                                buffer.randomly_edit(rng, 5, cx);
+                            } else {
+                                log::info!("randomly undoing/redoing in single buffer");
+                                buffer.randomly_undo_redo(rng, cx);
+                            }
+                        });
+                        false
+                    }
+                    70..=79 => {
+                        log::info!("mutating excerpts");
+                        editor.randomly_edit_excerpts(rng, 2, cx);
+                        false
+                    }
+                    80..=89 if !buffers.is_empty() => {
+                        log::info!("recalculating buffer diff");
+                        let buffer = buffers.iter().choose(rng).unwrap();
+                        let diff = editor
+                            .primary_multibuffer
+                            .read(cx)
+                            .diff_for(buffer.read(cx).remote_id())
+                            .unwrap();
+                        let buffer_snapshot = buffer.read(cx).text_snapshot();
+                        diff.update(cx, |diff, cx| {
+                            diff.recalculate_diff_sync(&buffer_snapshot, cx);
+                        });
+                        false
+                    }
+                    _ => {
+                        log::info!("quiescing");
+                        for buffer in buffers {
+                            let buffer_snapshot = buffer.read(cx).text_snapshot();
+                            let diff = editor
+                                .primary_multibuffer
+                                .read(cx)
+                                .diff_for(buffer.read(cx).remote_id())
+                                .unwrap();
+                            diff.update(cx, |diff, cx| {
+                                diff.recalculate_diff_sync(&buffer_snapshot, cx);
+                            });
+                            let diff_snapshot = diff.read(cx).snapshot(cx);
+                            let ranges = diff_snapshot
+                                .hunks(&buffer_snapshot)
+                                .map(|hunk| hunk.range)
+                                .collect::<Vec<_>>();
+                            let path = PathKey::for_buffer(&buffer, cx);
+                            editor.set_excerpts_for_path(path, buffer, ranges, 2, diff, cx);
+                        }
+                        true
+                    }
+                };
+
+                editor.check_invariants(quiesced, cx);
+            });
+        }
     }
 }
