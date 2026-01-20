@@ -3,7 +3,19 @@ use ui::{ButtonCommon, ButtonSize, Clickable, IconButton, IconName, IconSize};
 
 use crate::connector::ConnectorKind;
 use crate::constants::CRUSHED_BLOCK_HEIGHT;
-use crate::viewer::DiffViewer;
+use crate::viewer::{CollapsedRegion, DiffViewer};
+
+fn calc_collapsed_offset(regions: &[CollapsedRegion], base_row: f32) -> f32 {
+    let mut offset: f32 = 0.0;
+    for region in regions {
+        if region.end_line as f32 <= base_row {
+            let lines_hidden = (region.end_line - region.start_line) as f32;
+            let visual_height = 1.0;
+            offset += lines_hidden - visual_height;
+        }
+    }
+    offset
+}
 
 impl DiffViewer {
     pub fn render_left_editor_revert_buttons(
@@ -31,6 +43,8 @@ impl DiffViewer {
                 (line_height, scroll_pixels)
             });
 
+        let left_collapsed_regions = &self.left_collapsed_regions;
+
         for (index, curve) in self.connector_curves.iter().enumerate() {
             let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
             let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
@@ -56,19 +70,27 @@ impl DiffViewer {
                 0.0
             };
 
-            let left_row = if is_left_empty {
+            let base_left_row = if is_left_empty {
                 curve.focus_line as f32 + left_offset_rows
             } else {
                 curve.left_start as f32
             };
+            let left_collapsed_offset =
+                calc_collapsed_offset(left_collapsed_regions, base_left_row);
+            let left_row = base_left_row - left_collapsed_offset;
 
             let left_y = (left_row * current_line_height) - current_scroll_pixels;
+
+            let base_left_end = curve.left_end as f32 + 1.0;
+            let left_end_collapsed_offset =
+                calc_collapsed_offset(left_collapsed_regions, base_left_end);
+            let adjusted_left_end = base_left_end - left_end_collapsed_offset;
 
             let minimal_block_height = CRUSHED_BLOCK_HEIGHT;
             let left_bottom = if is_left_empty {
                 left_y + minimal_block_height
             } else {
-                ((curve.left_end as f32 + 1.0) * current_line_height - current_scroll_pixels)
+                (adjusted_left_end * current_line_height - current_scroll_pixels)
                     .max(left_y + minimal_block_height)
             };
 
