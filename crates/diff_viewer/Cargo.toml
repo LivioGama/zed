@@ -37,11 +37,3 @@ rand.workspace = true
 serde_json.workspace = true
 unindent.workspace = true
 zlog.workspace = true
-
-[[example]]
-name = "demo"
-path = "examples/demo.rs"
-
-[[example]]
-name = "demo_gpui"
-path = "examples/demo_gpui.rs"

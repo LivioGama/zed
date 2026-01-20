@@ -231,7 +231,14 @@ impl ProjectDiff {
                 )
             })?;
             cx.new_window_entity(|window, cx| {
-                Self::new_impl(branch_diff, project, workspace, window, cx)
+                let view_mode = SplitDiffSettings::get_global(cx).default_view.clone();
+                let mut diff = Self::new_impl(branch_diff, project, workspace, window, cx);
+
+                if view_mode == SplitDiffViewMode::Split {
+                    diff.create_split_diff_view(window, cx);
+                }
+
+                diff
             })
         })
     }
@@ -244,7 +251,14 @@ impl ProjectDiff {
     ) -> Self {
         let branch_diff =
             cx.new(|cx| branch_diff::BranchDiff::new(DiffBase::Head, project.clone(), window, cx));
-        Self::new_impl(branch_diff, project, workspace, window, cx)
+        let view_mode = SplitDiffSettings::get_global(cx).default_view.clone();
+        let mut diff = Self::new_impl(branch_diff, project, workspace, window, cx);
+
+        if view_mode == SplitDiffViewMode::Split {
+            diff.create_split_diff_view(window, cx);
+        }
+
+        diff
     }
 
     fn new_impl(
@@ -631,6 +645,13 @@ impl ProjectDiff {
         }
         if self.pending_scroll.as_ref() == Some(&path_key) {
             self.move_to_path(path_key, window, cx);
+        }
+
+        // Create split diff view if we just got content and are in Split mode
+        if was_empty && !self.multibuffer.read(cx).is_empty() {
+            if self.view_mode == SplitDiffViewMode::Split && self.split_diff_view.is_none() {
+                self.create_split_diff_view(window, cx);
+            }
         }
     }
 

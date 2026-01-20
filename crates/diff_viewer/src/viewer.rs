@@ -82,11 +82,13 @@ struct DiffDeletionHighlight;
 struct DiffModificationHighlight;
 
 #[derive(Clone)]
-pub struct CollapsedRegion {
-    pub block_id: CustomBlockId,
-    pub region_id: u32,
-    pub start_line: u32,
-    pub end_line: u32,
+struct CollapsedRegion {
+    block_id: CustomBlockId,
+    region_id: u32,
+    #[allow(dead_code)]
+    start_line: u32,
+    #[allow(dead_code)]
+    end_line: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -138,19 +140,200 @@ impl EventEmitter<()> for DiffViewer {}
 
 impl DiffViewer {
     fn map_left_line_to_right(&self, left_line: f32) -> f32 {
-        if left_line >= self.left_total_lines as f32 {
-            self.right_scroll_rows
-        } else {
-            left_line
+        if self.connector_curves.is_empty() {
+            return left_line.min(self.right_total_lines.saturating_sub(1) as f32);
         }
+
+        let right_max = self.right_total_lines.saturating_sub(1) as f32;
+        let half_viewport = self.right_visible_lines / 2.0;
+
+        let mut cumulative_offset: f32 = 0.0;
+        let mut prev_left_end: f32 = 0.0;
+
+        for curve in &self.connector_curves {
+            let left_block_start = curve.left_start as f32;
+            let left_block_end = if curve.left_crushed {
+                left_block_start
+            } else {
+                (curve.left_end + 1) as f32
+            };
+            let right_block_start = curve.right_start as f32;
+            let right_block_end = if curve.right_crushed {
+                right_block_start
+            } else {
+                (curve.right_end + 1) as f32
+            };
+
+            let left_block_len = if curve.left_crushed {
+                0.0
+            } else {
+                left_block_end - left_block_start
+            };
+            let right_block_len = if curve.right_crushed {
+                0.0
+            } else {
+                right_block_end - right_block_start
+            };
+            let block_diff = right_block_len - left_block_len;
+
+            let has_extra_left = left_block_len > right_block_len;
+
+            // Before the block
+            if left_line >= prev_left_end && left_line < left_block_start {
+                let result = left_line + cumulative_offset;
+                if has_extra_left {
+                    let stationary_pos =
+                        (right_block_start - half_viewport).max(0.0).min(right_max);
+                    return result.min(stationary_pos).max(0.0).min(right_max);
+                }
+                return result.max(0.0).min(right_max);
+            }
+
+            // Inside the block
+            if left_line >= left_block_start && left_line < left_block_end {
+                let progress_in_block = left_line - left_block_start;
+
+                if has_extra_left {
+                    let stationary_pos =
+                        (right_block_start - half_viewport).max(0.0).min(right_max);
+
+                    let extra_left = (left_block_len - right_block_len).max(0.0);
+                    let resume_threshold = (left_block_len - half_viewport).max(0.0);
+                    let resume_at = extra_left.min(resume_threshold);
+                    if progress_in_block < resume_at {
+                        return stationary_pos;
+                    }
+                    let fallback = right_block_start.max(0.0).min(right_max);
+                    let denom = left_block_len - resume_at;
+                    if denom <= 0.0 {
+                        return fallback;
+                    }
+                    let t = ((progress_in_block - resume_at) / denom).clamp(0.0, 1.0);
+                    let end = right_block_end.max(stationary_pos).min(right_max);
+                    let span = end - stationary_pos;
+                    if span <= 0.0 {
+                        return fallback;
+                    }
+                    let result = stationary_pos + t * span;
+                    return result.max(0.0).min(right_max);
+                } else {
+                    let ratio = if left_block_len > 0.0 {
+                        progress_in_block / left_block_len
+                    } else {
+                        0.5
+                    };
+                    let result = right_block_start + ratio * right_block_len;
+                    return result.max(0.0).min(right_max);
+                }
+            }
+
+            cumulative_offset += block_diff;
+            prev_left_end = left_block_end;
+        }
+
+        let result = left_line + cumulative_offset;
+        result.max(0.0).min(right_max)
     }
 
     fn map_right_line_to_left(&self, right_line: f32) -> f32 {
-        if right_line >= self.right_total_lines as f32 {
-            self.left_scroll_rows
-        } else {
-            right_line
+        if self.connector_curves.is_empty() {
+            return right_line.min(self.left_total_lines.saturating_sub(1) as f32);
         }
+
+        let left_max = self.left_total_lines.saturating_sub(1) as f32;
+        let half_viewport = self.left_visible_lines / 2.0;
+
+        let mut cumulative_offset: f32 = 0.0;
+        let mut prev_right_end: f32 = 0.0;
+
+        for curve in &self.connector_curves {
+            let left_block_start = curve.left_start as f32;
+            let left_block_end = if curve.left_crushed {
+                left_block_start
+            } else {
+                (curve.left_end + 1) as f32
+            };
+            let right_block_start = curve.right_start as f32;
+            let right_block_end = if curve.right_crushed {
+                right_block_start
+            } else {
+                (curve.right_end + 1) as f32
+            };
+
+            let left_block_len = if curve.left_crushed {
+                0.0
+            } else {
+                left_block_end - left_block_start
+            };
+            let right_block_len = if curve.right_crushed {
+                0.0
+            } else {
+                right_block_end - right_block_start
+            };
+            let block_diff = left_block_len - right_block_len;
+
+            let has_extra_right = right_block_len > left_block_len;
+            let has_extra_left = left_block_len > right_block_len;
+
+            if right_line >= prev_right_end && right_line < right_block_start {
+                let result = right_line + cumulative_offset;
+                if has_extra_right {
+                    let stationary_pos = (left_block_start - half_viewport).max(0.0).min(left_max);
+                    return result.min(stationary_pos).max(0.0).min(left_max);
+                }
+                return result.max(0.0).min(left_max);
+            }
+
+            if right_line >= right_block_start && right_line < right_block_end {
+                let progress_in_block = right_line - right_block_start;
+
+                if has_extra_right {
+                    let stationary_pos = (left_block_start - half_viewport).max(0.0).min(left_max);
+
+                    let extra_right = (right_block_len - left_block_len).max(0.0);
+                    let resume_threshold = (right_block_len - half_viewport).max(0.0);
+                    let resume_at = extra_right.min(resume_threshold);
+                    if progress_in_block < resume_at {
+                        return stationary_pos;
+                    }
+                    let fallback = left_block_start.max(0.0).min(left_max);
+                    let denom = right_block_len - resume_at;
+                    if denom <= 0.0 {
+                        return fallback;
+                    }
+                    let t = ((progress_in_block - resume_at) / denom).clamp(0.0, 1.0);
+                    let end = left_block_end.max(stationary_pos).min(left_max);
+                    let span = end - stationary_pos;
+                    if span <= 0.0 {
+                        return fallback;
+                    }
+                    let result = stationary_pos + t * span;
+                    return result.max(0.0).min(left_max);
+                } else if has_extra_left {
+                    let ratio = if right_block_len > 0.0 {
+                        progress_in_block / right_block_len
+                    } else {
+                        0.5
+                    };
+                    let result = left_block_start + ratio * left_block_len;
+                    return result.max(0.0).min(left_max);
+                } else {
+                    let ratio = if right_block_len > 0.0 {
+                        progress_in_block / right_block_len
+                    } else {
+                        0.5
+                    };
+                    let result = left_block_start + ratio * left_block_len;
+                    return result.max(0.0).min(left_max);
+                }
+            }
+
+            cumulative_offset += block_diff;
+            prev_right_end = right_block_end;
+        }
+
+        let result = right_line + cumulative_offset;
+        result.max(0.0).min(left_max)
     }
 
     fn request_sync_from_left(&mut self, source_rows: f32, cx: &mut Context<Self>) {
@@ -643,14 +826,12 @@ impl DiffViewer {
     fn render_left_crushed_blocks(&self, cx: &Context<Self>) -> impl IntoElement {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
-        let left_collapsed_regions = self.left_collapsed_regions.clone();
 
         let (_deleted_bg, created_bg, _modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct LeftCrushedCanvasData {
             curves: Vec<ConnectorCurve>,
-            collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             left_scroll_pixels: f32,
             left_top_origin: f32,
@@ -682,7 +863,6 @@ impl DiffViewer {
 
                 LeftCrushedCanvasData {
                     curves,
-                    collapsed_regions: left_collapsed_regions.clone(),
                     line_height: left_line_height,
                     left_scroll_pixels,
                     left_top_origin,
@@ -714,18 +894,7 @@ impl DiffViewer {
 
                     if curve.left_crushed {
                         let left_offset_rows = deleted_lines_above as f32;
-                        let base_row = curve.focus_line as f32 + left_offset_rows;
-
-                        let mut collapsed_lines_offset: f32 = 0.0;
-                        for region in &data.collapsed_regions {
-                            if region.end_line as f32 <= base_row {
-                                let lines_hidden = (region.end_line - region.start_line) as f32;
-                                let visual_height = 1.0;
-                                collapsed_lines_offset += lines_hidden - visual_height;
-                            }
-                        }
-
-                        let left_row = base_row - collapsed_lines_offset;
+                        let left_row = curve.focus_line as f32 + left_offset_rows;
                         let left_y = (left_row * data.line_height) - data.left_scroll_pixels;
                         let left_bottom = left_y + minimal_block_height;
 
@@ -769,14 +938,12 @@ impl DiffViewer {
     fn render_right_crushed_blocks(&self, cx: &Context<Self>) -> impl IntoElement {
         let curves = self.connector_curves.clone();
         let right_editor = self.right_editor.clone();
-        let right_collapsed_regions = self.right_collapsed_regions.clone();
 
         let (deleted_bg, _created_bg, _modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct RightCrushedCanvasData {
             curves: Vec<ConnectorCurve>,
-            collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             right_scroll_pixels: f32,
             right_top_origin: f32,
@@ -808,7 +975,6 @@ impl DiffViewer {
 
                 RightCrushedCanvasData {
                     curves,
-                    collapsed_regions: right_collapsed_regions.clone(),
                     line_height: right_line_height,
                     right_scroll_pixels,
                     right_top_origin,
@@ -839,18 +1005,7 @@ impl DiffViewer {
 
                     if curve.right_crushed {
                         let right_offset_rows = inserted_lines_above as f32;
-                        let base_row = curve.focus_line as f32 + right_offset_rows;
-
-                        let mut collapsed_lines_offset: f32 = 0.0;
-                        for region in &data.collapsed_regions {
-                            if region.end_line as f32 <= base_row {
-                                let lines_hidden = (region.end_line - region.start_line) as f32;
-                                let visual_height = 1.0;
-                                collapsed_lines_offset += lines_hidden - visual_height;
-                            }
-                        }
-
-                        let right_row = base_row - collapsed_lines_offset;
+                        let right_row = curve.focus_line as f32 + right_offset_rows;
                         let right_y = (right_row * data.line_height) - data.right_scroll_pixels;
                         let right_bottom = right_y + minimal_block_height;
 
@@ -895,16 +1050,12 @@ impl DiffViewer {
         let curves = self.connector_curves.clone();
         let left_editor = self.left_editor.clone();
         let right_editor = self.right_editor.clone();
-        let left_collapsed_regions = self.left_collapsed_regions.clone();
-        let right_collapsed_regions = self.right_collapsed_regions.clone();
 
         let (deleted_bg, created_bg, modified_bg) = get_diff_colors(cx);
 
         #[derive(Clone)]
         struct ConnectorCanvasData {
             curves: Vec<ConnectorCurve>,
-            left_collapsed_regions: Vec<CollapsedRegion>,
-            right_collapsed_regions: Vec<CollapsedRegion>,
             line_height: f32,
             left_scroll_pixels: f32,
             right_scroll_pixels: f32,
@@ -963,8 +1114,6 @@ impl DiffViewer {
 
                 ConnectorCanvasData {
                     curves,
-                    left_collapsed_regions: left_collapsed_regions.clone(),
-                    right_collapsed_regions: right_collapsed_regions.clone(),
                     line_height,
                     left_scroll_pixels,
                     right_scroll_pixels,
@@ -990,18 +1139,6 @@ impl DiffViewer {
 
                 let left_offset = data.left_top_origin - f32::from(bounds.origin.y);
                 let right_offset = data.right_top_origin - f32::from(bounds.origin.y);
-
-                let calc_collapsed_offset = |regions: &[CollapsedRegion], base_row: f32| -> f32 {
-                    let mut offset: f32 = 0.0;
-                    for region in regions {
-                        if region.end_line as f32 <= base_row {
-                            let lines_hidden = (region.end_line - region.start_line) as f32;
-                            let visual_height = 1.0;
-                            offset += lines_hidden - visual_height;
-                        }
-                    }
-                    offset
-                };
 
                 let minimal_block_height = 2.0;
                 let mut inserted_lines_above = 0usize;
@@ -1038,48 +1175,33 @@ impl DiffViewer {
                         }
                     }
 
-                    let base_left_row = if is_left_empty {
+                    let left_row = if is_left_empty {
                         curve.focus_line as f32 + left_offset_rows
                     } else {
                         curve.left_start as f32
                     };
-                    let left_collapsed_offset =
-                        calc_collapsed_offset(&data.left_collapsed_regions, base_left_row);
-                    let left_row = base_left_row - left_collapsed_offset;
 
-                    let base_right_row = if is_right_empty {
+                    let right_row = if is_right_empty {
                         curve.focus_line as f32 + right_offset_rows
                     } else {
                         curve.right_start as f32
                     };
-                    let right_collapsed_offset =
-                        calc_collapsed_offset(&data.right_collapsed_regions, base_right_row);
-                    let right_row = base_right_row - right_collapsed_offset;
 
                     let left_y = (left_row * data.line_height) - data.left_scroll_pixels;
                     let right_y = (right_row * data.line_height) - data.right_scroll_pixels;
 
-                    let base_left_end = curve.left_end as f32 + 1.0;
-                    let left_end_collapsed_offset =
-                        calc_collapsed_offset(&data.left_collapsed_regions, base_left_end);
-                    let adjusted_left_end = base_left_end - left_end_collapsed_offset;
-
-                    let base_right_end = curve.right_end as f32 + 1.0;
-                    let right_end_collapsed_offset =
-                        calc_collapsed_offset(&data.right_collapsed_regions, base_right_end);
-                    let adjusted_right_end = base_right_end - right_end_collapsed_offset;
-
                     let left_bottom = if is_left_empty {
                         left_y + minimal_block_height
                     } else {
-                        (adjusted_left_end * data.line_height - data.left_scroll_pixels)
+                        ((curve.left_end as f32 + 1.0) * data.line_height - data.left_scroll_pixels)
                             .max(left_y + minimal_block_height)
                     };
 
                     let right_bottom = if is_right_empty {
                         right_y + minimal_block_height
                     } else {
-                        (adjusted_right_end * data.line_height - data.right_scroll_pixels)
+                        ((curve.right_end as f32 + 1.0) * data.line_height
+                            - data.right_scroll_pixels)
                             .max(right_y + minimal_block_height)
                     };
 
@@ -1620,18 +1742,6 @@ impl DiffViewer {
                 (line_height, scroll_pixels)
             });
 
-        let calc_collapsed_offset = |regions: &[CollapsedRegion], base_row: f32| -> f32 {
-            let mut offset: f32 = 0.0;
-            for region in regions {
-                if region.end_line as f32 <= base_row {
-                    let lines_hidden = (region.end_line - region.start_line) as f32;
-                    let visual_height = 1.0;
-                    offset += lines_hidden - visual_height;
-                }
-            }
-            offset
-        };
-
         for (index, curve) in self.connector_curves.iter().enumerate() {
             let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
             let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
@@ -1657,27 +1767,19 @@ impl DiffViewer {
                 0.0
             };
 
-            let base_left_row = if is_left_empty {
+            let left_row = if is_left_empty {
                 curve.focus_line as f32 + left_offset_rows
             } else {
                 curve.left_start as f32
             };
-            let left_collapsed_offset =
-                calc_collapsed_offset(&self.left_collapsed_regions, base_left_row);
-            let left_row = base_left_row - left_collapsed_offset;
 
             let left_y = (left_row * current_line_height) - current_scroll_pixels;
-
-            let base_left_end = curve.left_end as f32 + 1.0;
-            let left_end_collapsed_offset =
-                calc_collapsed_offset(&self.left_collapsed_regions, base_left_end);
-            let adjusted_left_end = base_left_end - left_end_collapsed_offset;
 
             let minimal_block_height = 4.0;
             let left_bottom = if is_left_empty {
                 left_y + minimal_block_height
             } else {
-                (adjusted_left_end * current_line_height - current_scroll_pixels)
+                ((curve.left_end as f32 + 1.0) * current_line_height - current_scroll_pixels)
                     .max(left_y + minimal_block_height)
             };
 
