@@ -3,10 +3,12 @@ use crate::{
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
     remote_button::{render_publish_button, render_push_button},
+    split_diff_settings::{SplitDiffSettings, SplitDiffViewMode},
 };
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use collections::{HashMap, HashSet};
+use diff_viewer::DiffViewer;
 use editor::{
     Addon, Editor, EditorEvent, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk},
@@ -58,6 +60,8 @@ actions!(
         /// branch (typically main or master).
         BranchDiff,
         LeaderAndFollower,
+        /// Toggle between unified and split diff view.
+        ToggleSplitDiff,
     ]
 );
 
@@ -70,6 +74,8 @@ pub struct ProjectDiff {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
+    view_mode: SplitDiffViewMode,
+    split_diff_view: Option<Entity<DiffViewer>>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -91,6 +97,15 @@ impl ProjectDiff {
         workspace.register_action(Self::deploy_branch_diff);
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleSplitDiff, window, cx| {
+            if let Some(active_item) = workspace.active_item(cx) {
+                if let Some(project_diff) = active_item.downcast::<ProjectDiff>() {
+                    project_diff.update(cx, |view, cx| {
+                        view.toggle_split_diff(window, cx);
+                    });
+                }
+            }
         });
         workspace::register_serializable_item::<ProjectDiff>(cx);
     }
@@ -322,6 +337,8 @@ impl ProjectDiff {
             async |cx| Self::refresh(this, RefreshReason::StatusesChanged, cx).await
         });
 
+        let view_mode = SplitDiffSettings::get_global(cx).default_view.clone();
+
         Self {
             project,
             workspace: workspace.downgrade(),
@@ -331,6 +348,8 @@ impl ProjectDiff {
             multibuffer,
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
+            view_mode,
+            split_diff_view: None,
             _task: task,
             _subscription: branch_diff_subscription,
         }
@@ -711,6 +730,44 @@ impl ProjectDiff {
             .map(|key| key.path.clone())
             .collect()
     }
+
+    fn toggle_split_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let new_view_mode = match self.view_mode {
+            SplitDiffViewMode::Unified => SplitDiffViewMode::Split,
+            SplitDiffViewMode::Split => SplitDiffViewMode::Unified,
+        };
+
+        self.view_mode = new_view_mode.clone();
+
+        let fs = self.project.read(cx).fs().clone();
+        let new_view_mode_clone = new_view_mode.clone();
+        settings::update_settings_file(fs, cx, move |settings, _cx| {
+            settings.git_split_diff.get_or_insert_default().default_view =
+                Some(new_view_mode_clone);
+        });
+
+        match new_view_mode {
+            SplitDiffViewMode::Unified => {
+                self.split_diff_view = None;
+            }
+            SplitDiffViewMode::Split => {
+                self.create_split_diff_view(window, cx);
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn create_split_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fs = self.project.read(cx).fs().clone();
+        let view = cx.new(|cx| {
+            let mut viewer = DiffViewer::new(None, None, fs, window, cx);
+            viewer.initialize(window, cx);
+            viewer
+        });
+        self.split_diff_view = Some(view);
+        cx.notify();
+    }
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -982,7 +1039,13 @@ impl Render for ProjectDiff {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                if let Some(split_view) = &self.split_diff_view {
+                    el.child(split_view.clone())
+                } else {
+                    el.child(self.editor.clone())
+                }
+            })
     }
 }
 

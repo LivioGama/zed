@@ -46,6 +46,9 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+// TODO: split_diff_model needs API updates
+// pub mod split_diff_model;
+pub mod split_diff_settings;
 pub mod stash_picker;
 pub mod text_diff_view;
 pub mod worktree_picker;

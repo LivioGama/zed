@@ -7244,6 +7244,7 @@ dependencies = [
  "component",
  "ctor",
  "db",
+ "diff_viewer",
  "editor",
  "futures 0.3.31",
  "fuzzy",
