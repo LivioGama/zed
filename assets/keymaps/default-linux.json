@@ -948,6 +948,12 @@
     }
   },
   {
+    "context": "GitDiff",
+    "bindings": {
+      "ctrl-\\": "git::ToggleSplitDiff"
+    }
+  },
+  {
     "context": "GitDiff > Editor",
     "bindings": {
       "ctrl-enter": "git::Commit",

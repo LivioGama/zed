@@ -372,7 +372,12 @@ impl ProjectDiff {
         let sort_prefix = sort_prefix(repo, &entry.repo_path, entry.status, cx);
         let path_key = PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
 
-        self.move_to_path(path_key, window, cx)
+        self.move_to_path(path_key, window, cx);
+
+        // Update split diff view if in split mode
+        if self.view_mode == SplitDiffViewMode::Split {
+            self.update_split_diff_for_entry(&entry, window, cx);
+        }
     }
 
     pub fn active_path(&self, cx: &App) -> Option<ProjectPath> {
@@ -765,8 +770,94 @@ impl ProjectDiff {
             viewer.initialize(window, cx);
             viewer
         });
-        self.split_diff_view = Some(view);
+        self.split_diff_view = Some(view.clone());
+
+        // Load initial content if there's an active path
+        if let Some(active_path) = self.active_path(cx) {
+            self.update_split_diff_for_project_path(&active_path, window, cx);
+        }
+
         cx.notify();
+    }
+
+    fn update_split_diff_for_entry(
+        &mut self,
+        entry: &GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+            return;
+        };
+
+        let project_path = git_repo
+            .read(cx)
+            .repo_path_to_project_path(&entry.repo_path, cx);
+        let Some(project_path) = project_path else {
+            return;
+        };
+
+        self.update_split_diff_for_project_path(&project_path, window, cx);
+    }
+
+    fn update_split_diff_for_project_path(
+        &mut self,
+        project_path: &ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(viewer) = self.split_diff_view.clone() else {
+            return;
+        };
+
+        let Some(git_repo) = self.branch_diff.read(cx).repo().cloned() else {
+            return;
+        };
+
+        let repo_path = git_repo
+            .read(cx)
+            .project_path_to_repo_path(project_path, cx);
+        let Some(repo_path) = repo_path else {
+            return;
+        };
+
+        // Try to get the BufferDiff for this file to access base text
+        let rel_path: Arc<RelPath> = repo_path.as_ref().clone().into();
+        let buffer_diff = self
+            .buffer_diff_subscriptions
+            .get(&rel_path)
+            .map(|(diff, _)| diff.clone());
+
+        // Get the base text synchronously if available
+        let left_content = buffer_diff
+            .as_ref()
+            .and_then(|diff| diff.read(cx).base_text_string(cx))
+            .unwrap_or_default();
+
+        // Get the buffer open task
+        let buffer_task = self.project.update(cx, |project, cx| {
+            project.open_buffer(project_path.clone(), cx)
+        });
+
+        cx.spawn_in(window, async move |_, mut cx| {
+            let right_buffer = buffer_task.await?;
+
+            cx.update(|_window, cx| {
+                let right_content = right_buffer.read(cx).text();
+
+                viewer.update(cx, |viewer, cx| {
+                    viewer.update_content(left_content, right_content, cx);
+                    viewer.set_language_from_source_buffers(
+                        Some(&right_buffer),
+                        Some(&right_buffer),
+                        cx,
+                    );
+                });
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 }
 
