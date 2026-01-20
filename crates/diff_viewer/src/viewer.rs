@@ -1791,6 +1791,7 @@ impl DiffViewer {
     ) -> Vec<impl IntoElement> {
         let mut buttons = Vec::new();
         let mut deleted_lines_above = 0usize;
+        let mut inserted_lines_above = 0usize;
 
         let rem_size = window.rem_size();
         let icon_height = ui::IconSize::Small.rems().to_pixels(rem_size);
@@ -1811,26 +1812,21 @@ impl DiffViewer {
 
         let left_collapsed_regions = &self.left_collapsed_regions;
 
-        fn calc_collapsed_offset(regions: &[CollapsedRegion], base_row: f32) -> f32 {
-            let mut offset: f32 = 0.0;
-            for region in regions {
-                if region.end_line as f32 <= base_row {
-                    let lines_hidden = (region.end_line - region.start_line) as f32;
-                    let visual_height = 1.0;
-                    offset += lines_hidden - visual_height;
-                }
-            }
-            offset
-        }
-
         for (index, curve) in self.connector_curves.iter().enumerate() {
             let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
             let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
 
-            if curve.right_crushed {
+            // Update the line counters to match connector logic
+            if curve.left_crushed {
+                inserted_lines_above += right_len;
+            } else if curve.right_crushed {
                 deleted_lines_above += left_len;
-            } else if !curve.left_crushed && right_len < left_len {
-                deleted_lines_above += left_len - right_len;
+            } else {
+                if left_len < right_len {
+                    inserted_lines_above += right_len - left_len;
+                } else if right_len < left_len {
+                    deleted_lines_above += left_len - right_len;
+                }
             }
 
             if !matches!(
@@ -1855,6 +1851,19 @@ impl DiffViewer {
             };
             let left_collapsed_offset =
                 calc_collapsed_offset(left_collapsed_regions, base_left_row);
+            let left_row = base_left_row - left_collapsed_offset;
+
+            let left_collapsed_offset = {
+                let mut offset: f32 = 0.0;
+                for region in left_collapsed_regions {
+                    if region.end_line as f32 <= base_left_row {
+                        let lines_hidden = (region.end_line - region.start_line) as f32;
+                        let visual_height = 1.0;
+                        offset += lines_hidden - visual_height;
+                    }
+                }
+                offset
+            };
             let left_row = base_left_row - left_collapsed_offset;
 
             let left_y = (left_row * current_line_height) - current_scroll_pixels;

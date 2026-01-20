@@ -25,6 +25,7 @@ impl DiffViewer {
     ) -> Vec<impl IntoElement> {
         let mut buttons = Vec::new();
         let mut deleted_lines_above = 0usize;
+        let mut inserted_lines_above = 0usize;
 
         let rem_size = window.rem_size();
         let icon_height = IconSize::Small.rems().to_pixels(rem_size);
@@ -49,10 +50,17 @@ impl DiffViewer {
             let left_len = curve.left_end.saturating_sub(curve.left_start) + 1;
             let right_len = curve.right_end.saturating_sub(curve.right_start) + 1;
 
-            if curve.right_crushed {
+            // Update the line counters to match connector logic
+            if curve.left_crushed {
+                inserted_lines_above += right_len;
+            } else if curve.right_crushed {
                 deleted_lines_above += left_len;
-            } else if !curve.left_crushed && right_len < left_len {
-                deleted_lines_above += left_len - right_len;
+            } else {
+                if left_len < right_len {
+                    inserted_lines_above += right_len - left_len;
+                } else if right_len < left_len {
+                    deleted_lines_above += left_len - right_len;
+                }
             }
 
             if !matches!(
