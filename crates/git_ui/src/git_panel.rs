@@ -21,6 +21,7 @@ use editor::{
     actions::ExpandAllDiffHunks,
 };
 use futures::StreamExt as _;
+use git_graph::OpenGitGraph;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions, GitCommitter,
@@ -4768,8 +4769,8 @@ impl GitPanel {
         ix: usize,
         header: &GitHeaderEntry,
         _: bool,
-        _: &Window,
-        _: &Context<Self>,
+        window: &Window,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let id: ElementId = ElementId::Name(format!("header_{}", ix).into());
 
@@ -4786,6 +4787,15 @@ impl GitPanel {
                     .size(LabelSize::Small)
                     .line_height_style(LineHeightStyle::UiLabel)
                     .single_line(),
+            )
+            .child(
+                IconButton::new("open-git-graph", IconName::GitGraph)
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(OpenGitGraph), cx);
+                    })
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action("Open Git Graph", &OpenGitGraph, cx)
+                    }),
             )
             .into_any_element()
     }
