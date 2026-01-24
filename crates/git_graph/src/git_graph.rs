@@ -1,39 +1,52 @@
+mod git_modals;
 mod graph;
 mod graph_rendering;
-mod git_modals;
 
 use git_modals::{GitModal, ModalAction};
 use graph::format_timestamp;
 
+use git::repository::{CommitDiff, CommitFile, LogOrder, LogSource};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{CommitDiff, LogOrder, LogSource},
 };
 use git_ui::commit_tooltip::CommitAvatar;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Corner, DefiniteLength, DismissEvent, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, ParentElement,
-    Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Task, WeakEntity,
-    Window, actions, anchored, deferred, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Corner, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, Point, Render, ScrollWheelEvent, Subscription, Task,
+    WeakEntity, actions, anchored, deferred, px,
 };
 use graph_rendering::accent_colors_count;
+use project::git_store::CommitDataState;
 use project::{
     Project,
-    git_store::{CommitDataState, GitStoreEvent, Repository, RepositoryEvent},
+    git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 use settings::Settings;
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 use theme::ThemeSettings;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{ContextMenu, ScrollableHandle, Table, TableInteractionState, Tooltip, prelude::*};
 use util::TryFutureExt;
+
+#[derive(Debug)]
+struct TreeNode {
+    children: HashMap<String, TreeNode>,
+    file: Option<CommitFile>,
+}
 use workspace::{
     Workspace,
     item::{Item, ItemEvent, SerializableItem},
 };
 
 use crate::{graph::AllCommitCount, graph_rendering::render_graph};
+
+/// Action to set the context branch before performing branch operations.
+#[derive(Clone, PartialEq, Debug, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct SetContextBranch {
+    pub branch_name: SharedString,
+    pub is_remote: bool,
+}
 
 actions!(
     git_graph,
@@ -44,6 +57,8 @@ actions!(
         OpenCommitView,
         /// Checkout/switch to a branch.
         CheckoutBranch,
+        /// Checkout a specific commit revision (detached HEAD).
+        CheckoutRevision,
         /// Pull changes from remote with smart stash/unstash.
         PullWithStash,
         /// Merge a branch into current.
@@ -52,8 +67,26 @@ actions!(
         RebaseOnto,
         /// Squash selected commits.
         SquashCommits,
+        /// Drop selected commits.
+        DropCommits,
+        /// Reword selected commits.
+        RewordCommits,
+        /// Edit/amend the selected commit.
+        EditAmendCommit,
+        /// Cherry-pick selected commits.
+        CherryPick,
+        /// Revert selected commits.
+        RevertCommits,
         /// Delete a branch.
         DeleteBranch,
+        /// Navigate to previous commit.
+        SelectPreviousCommit,
+        /// Navigate to next commit.
+        SelectNextCommit,
+        /// Extend selection to previous commit.
+        SelectPreviousCommitExtend,
+        /// Extend selection to next commit.
+        SelectNextCommitExtend,
     ]
 );
 
@@ -61,7 +94,6 @@ pub fn init(cx: &mut App) {
     workspace::register_serializable_item::<GitGraph>(cx);
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
-        // todo!: We should only register this action when project has a repo we can use to generate the graph
         workspace.register_action(|workspace, _: &OpenGitGraph, window, cx| {
             let project = workspace.project().clone();
             let git_graph = cx.new(|cx| GitGraph::new(project, window, cx));
@@ -70,8 +102,177 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
-    // Actions are handled through the focus system and don't need explicit registration
-    // The action handlers are implemented as methods on GitGraph
+    // Register keyboard navigation actions
+    cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action(|workspace, _: &SquashCommits, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.squash_commits(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &DropCommits, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.drop_commits(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &RewordCommits, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.reword_commits(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &EditAmendCommit, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.edit_amend_commit(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &SelectNextCommit, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.select_next_commit(cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &SelectPreviousCommitExtend, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.select_previous_commit_extend(cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &SelectNextCommitExtend, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.select_next_commit_extend(cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &CherryPick, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.cherry_pick(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &CherryPick, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.cherry_pick(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &RevertCommits, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| this.revert_commits(window, cx))
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, action: &SetContextBranch, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| {
+                            this.context_branch_name = Some(action.branch_name.clone());
+                            this.context_is_remote = action.is_remote;
+                        })
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &CheckoutBranch, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| {
+                            if let Some(branch_name) = this.context_branch_name.clone() {
+                                this.checkout_branch(branch_name, window, cx);
+                            }
+                        })
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &MergeBranch, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| {
+                            if let Some(branch_name) = this.context_branch_name.clone() {
+                                this.merge_branch(branch_name, window, cx);
+                            }
+                        })
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &RebaseOnto, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| {
+                            if let Some(branch_name) = this.context_branch_name.clone() {
+                                this.rebase_onto(branch_name, window, cx);
+                            }
+                        })
+                    });
+                }
+            });
+        });
+        workspace.register_action(|workspace, _: &CheckoutRevision, window, cx| {
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                if let Some(item) = pane.active_item() {
+                    item.downcast::<GitGraph>().map(|git_graph| {
+                        git_graph.update(cx, |this, cx| {
+                            this.checkout_revision(window, cx);
+                        })
+                    });
+                }
+            });
+        });
+    })
+    .detach();
 }
 
 pub struct GitGraph {
@@ -89,6 +290,7 @@ pub struct GitGraph {
     graph_viewport_width: Pixels,
     selected_entry_idx: Option<usize>,
     selected_entry_indices: Vec<usize>,
+    selected_branches: Vec<SharedString>,
     modal: Option<Entity<GitModal>>,
     log_source: LogSource,
     log_order: LogOrder,
@@ -168,6 +370,7 @@ impl GitGraph {
             graph_viewport_width: px(88.),
             selected_entry_idx: None,
             selected_entry_indices: Vec::new(),
+            selected_branches: Vec::new(),
             modal: None,
             selected_commit_diff: None,
             log_source,
@@ -202,9 +405,21 @@ impl GitGraph {
         }
     }
 
-    fn render_badge(&self, name: &SharedString, accent_color: gpui::Hsla, cx: &Context<Self>) -> impl IntoElement {
+    fn render_badge(
+        &self,
+        name: &SharedString,
+        accent_color: gpui::Hsla,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let branch_name = name.clone();
+        // Strip "HEAD -> " prefix for display
+        let display_name: SharedString = if let Some(stripped) = name.strip_prefix("HEAD -> ") {
+            stripped.to_string().into()
+        } else {
+            name.clone()
+        };
         let is_remote = name.starts_with("remotes/") || name.contains("origin/");
+        let is_selected = self.selected_branches.contains(&branch_name);
 
         div()
             .px_1p5()
@@ -215,19 +430,56 @@ impl GitGraph {
             .items_center()
             .justify_center()
             .rounded_md()
-            .bg(accent_color.opacity(0.18))
+            .bg(if is_selected {
+                accent_color.opacity(0.35)
+            } else {
+                accent_color.opacity(0.18)
+            })
             .border_1()
-            .border_color(accent_color.opacity(0.55))
+            .border_color(if is_selected {
+                accent_color.opacity(0.75)
+            } else {
+                accent_color.opacity(0.55)
+            })
             .child(
-                Label::new(name.clone())
+                Label::new(display_name)
                     .size(LabelSize::Small)
                     .color(Color::Default)
                     .single_line(),
             )
             .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener({
+                    let value = branch_name.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        if event.modifiers.secondary() {
+                            // Multi-select mode: toggle selection
+                            if let Some(pos) =
+                                this.selected_branches.iter().position(|b| b == &value)
+                            {
+                                this.selected_branches.remove(pos);
+                            } else {
+                                this.selected_branches.push(value.clone());
+                            }
+                        } else {
+                            // Single-select mode: clear and select only this branch
+                            this.selected_branches.clear();
+                            this.selected_branches.push(value.clone());
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    this.show_context_menu_for_branch(branch_name.clone(), is_remote, event.position, window, cx);
+                    this.show_context_menu_for_branch(
+                        branch_name.clone(),
+                        is_remote,
+                        event.position,
+                        window,
+                        cx,
+                    );
                 }),
             )
     }
@@ -271,7 +523,7 @@ impl GitGraph {
                     ];
                 };
 
-                let data = repository.update(cx, |repository, cx| {
+                let commit_data = repository.update(cx, |repository, cx| {
                     repository.fetch_commit_data(commit.data.sha, cx).clone()
                 });
 
@@ -280,7 +532,7 @@ impl GitGraph {
                 let subject;
                 let author_name;
 
-                if let CommitDataState::Loaded(data) = data {
+                if let CommitDataState::Loaded(data) = commit_data {
                     subject = data.subject.clone();
                     author_name = data.author_name.clone();
                     formatted_time = format_timestamp(data.commit_timestamp);
@@ -295,7 +547,7 @@ impl GitGraph {
                     .get(commit.color_idx)
                     .copied()
                     .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
-                let is_selected = self.selected_entry_idx == Some(idx);
+                let is_selected = self.selected_entry_indices.contains(&idx);
                 let text_color = if is_selected {
                     Color::Default
                 } else {
@@ -318,7 +570,8 @@ impl GitGraph {
                                             .data
                                             .ref_names
                                             .iter()
-                                            .map(|name| self.render_badge(name, accent_color, cx)),
+                                            .map(|name| self.render_badge(name, accent_color, cx))
+                                            .collect::<Vec<_>>(),
                                     )
                                 }))
                                 .child(
@@ -352,6 +605,7 @@ impl GitGraph {
         }
 
         self.selected_entry_idx = Some(idx);
+        // Don't clear selected_entry_indices here since it's handled by the caller
         self.selected_commit_diff = None;
 
         let Some(commit) = self.graph.commits.get(idx) else {
@@ -382,6 +636,84 @@ impl GitGraph {
         cx.notify();
     }
 
+    fn select_previous_commit(&mut self, cx: &mut Context<Self>) {
+        if self.graph.commits.is_empty() {
+            return;
+        }
+
+        let current_idx = self.selected_entry_idx.unwrap_or(0);
+        let new_idx = if current_idx == 0 {
+            self.graph.commits.len() - 1
+        } else {
+            current_idx - 1
+        };
+
+        self.selected_entry_indices.clear();
+        self.selected_entry_indices.push(new_idx);
+        self.select_entry(new_idx, cx);
+    }
+
+    fn select_next_commit(&mut self, cx: &mut Context<Self>) {
+        if self.graph.commits.is_empty() {
+            return;
+        }
+
+        let current_idx = self.selected_entry_idx.unwrap_or(0);
+        let new_idx = if current_idx >= self.graph.commits.len() - 1 {
+            0
+        } else {
+            current_idx + 1
+        };
+
+        self.selected_entry_indices.clear();
+        self.selected_entry_indices.push(new_idx);
+        self.select_entry(new_idx, cx);
+    }
+
+    fn select_previous_commit_extend(&mut self, cx: &mut Context<Self>) {
+        if self.graph.commits.is_empty() {
+            return;
+        }
+
+        let current_idx = self.selected_entry_idx.unwrap_or(0);
+        let new_idx = if current_idx == 0 {
+            self.graph.commits.len() - 1
+        } else {
+            current_idx - 1
+        };
+
+        // Add to selection if not already selected
+        if !self.selected_entry_indices.contains(&new_idx) {
+            self.selected_entry_indices.push(new_idx);
+            self.selected_entry_idx = Some(new_idx);
+            self.selected_commit_diff = None;
+            self._commit_diff_task = None;
+            cx.notify();
+        }
+    }
+
+    fn select_next_commit_extend(&mut self, cx: &mut Context<Self>) {
+        if self.graph.commits.is_empty() {
+            return;
+        }
+
+        let current_idx = self.selected_entry_idx.unwrap_or(0);
+        let new_idx = if current_idx >= self.graph.commits.len() - 1 {
+            0
+        } else {
+            current_idx + 1
+        };
+
+        // Add to selection if not already selected
+        if !self.selected_entry_indices.contains(&new_idx) {
+            self.selected_entry_indices.push(new_idx);
+            self.selected_entry_idx = Some(new_idx);
+            self.selected_commit_diff = None;
+            self._commit_diff_task = None;
+            cx.notify();
+        }
+    }
+
     fn show_context_menu_for_branch(
         &mut self,
         branch_name: SharedString,
@@ -393,32 +725,64 @@ impl GitGraph {
         self.context_branch_name = Some(branch_name.clone());
         self.context_is_remote = is_remote;
 
+        let selected_count = self.selected_branches.len();
+        let has_multiple = selected_count > 1;
+        let is_selected = self.selected_branches.contains(&branch_name);
+
         let menu = ContextMenu::build(window, cx, |mut menu, _focus_handle, cx| {
-            menu = menu.entry("Checkout", None, |_window, cx| {
-                cx.dispatch_action(&CheckoutBranch)
-            });
+            if has_multiple {
+                // Multi-branch operations
+                menu = menu.entry(
+                    format!("Checkout {} Branches", selected_count),
+                    None,
+                    |_window, _cx| {
+                        // TODO: Implement bulk checkout
+                    },
+                );
 
-            if !is_remote {
-                menu = menu
-                    .separator()
-                    .entry("Merge into Current", None, |_window, cx| {
-                        cx.dispatch_action(&MergeBranch)
-                    })
-                    .entry("Rebase Current Onto", None, |_window, cx| {
-                        cx.dispatch_action(&RebaseOnto)
-                    })
-                    .separator()
-                    .entry("Delete Branch...", None, |_window, cx| {
-                        cx.dispatch_action(&DeleteBranch)
-                    });
-            }
+                if !is_remote {
+                    menu = menu.separator().entry(
+                        format!("Delete {} Branches...", selected_count),
+                        None,
+                        |_window, cx| cx.dispatch_action(&DeleteBranch),
+                    );
+                }
 
-            if is_remote {
-                menu = menu
-                    .separator()
-                    .entry("Delete Remote Branch...", None, |_window, cx| {
-                        cx.dispatch_action(&DeleteBranch)
-                    });
+                if is_remote {
+                    menu = menu.separator().entry(
+                        format!("Delete {} Remote Branches...", selected_count),
+                        None,
+                        |_window, cx| cx.dispatch_action(&DeleteBranch),
+                    );
+                }
+            } else {
+                // Single branch operations
+                menu = menu.entry("Checkout", None, |_window, cx| {
+                    cx.dispatch_action(&CheckoutBranch)
+                });
+
+                if !is_remote {
+                    menu = menu
+                        .separator()
+                        .entry("Merge into Current", None, |_window, cx| {
+                            cx.dispatch_action(&MergeBranch)
+                        })
+                        .entry("Rebase Current Onto", None, |_window, cx| {
+                            cx.dispatch_action(&RebaseOnto)
+                        })
+                        .separator()
+                        .entry("Delete Branch...", None, |_window, cx| {
+                            cx.dispatch_action(&DeleteBranch)
+                        });
+                }
+
+                if is_remote {
+                    menu =
+                        menu.separator()
+                            .entry("Delete Remote Branch...", None, |_window, cx| {
+                                cx.dispatch_action(&DeleteBranch)
+                            });
+                }
             }
 
             menu
@@ -434,6 +798,35 @@ impl GitGraph {
         cx.notify();
     }
 
+    /// Prettify a branch name for display:
+    /// - Strips "HEAD -> " prefix
+    /// - Remote branches (refs/remotes/origin/foo) -> "origin/foo"
+    /// - Local branches keep just the branch name
+    fn prettify_branch_name(name: &str) -> (String, bool) {
+        // Strip "HEAD -> " prefix if present
+        let name = name.strip_prefix("HEAD -> ").unwrap_or(name);
+
+        // Check for remote branch patterns
+        let is_remote = name.starts_with("origin/")
+            || name.starts_with("upstream/")
+            || name.starts_with("refs/remotes/")
+            || (name.contains('/') && !name.starts_with("refs/heads/"));
+
+        let pretty_name = if name.starts_with("refs/remotes/") {
+            // refs/remotes/origin/main -> origin/main
+            name.strip_prefix("refs/remotes/")
+                .unwrap_or(name)
+                .to_string()
+        } else if name.starts_with("refs/heads/") {
+            // refs/heads/main -> main
+            name.strip_prefix("refs/heads/").unwrap_or(name).to_string()
+        } else {
+            name.to_string()
+        };
+
+        (pretty_name, is_remote)
+    }
+
     fn show_context_menu_for_commits(
         &mut self,
         position: Point<Pixels>,
@@ -441,15 +834,133 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         let selected_count = self.selected_entry_indices.len().max(1);
-        let can_squash = selected_count >= 2;
+
+        // Collect branch info for all selected commits
+        let mut all_branches: Vec<(usize, Vec<SharedString>)> = Vec::new();
+        for &idx in &self.selected_entry_indices {
+            if let Some(commit) = self.graph.commits.get(idx) {
+                let branches: Vec<SharedString> = commit
+                    .data
+                    .ref_names
+                    .iter()
+                    .filter(|name| name.as_ref() != "HEAD")
+                    .cloned()
+                    .collect();
+                if !branches.is_empty() {
+                    all_branches.push((idx, branches));
+                }
+            }
+        }
+
+        // Check if all selected commits share at least one common branch
+        // This is required for squash and drop operations
+        let commits_on_same_branch = if selected_count >= 2 {
+            // Get branches for all selected commits
+            let mut branch_sets: Vec<std::collections::HashSet<&str>> = Vec::new();
+            for &idx in &self.selected_entry_indices {
+                if let Some(commit) = self.graph.commits.get(idx) {
+                    let branches: std::collections::HashSet<&str> = commit
+                        .data
+                        .ref_names
+                        .iter()
+                        .filter(|name| name.as_ref() != "HEAD")
+                        .map(|s| s.as_ref())
+                        .collect();
+                    branch_sets.push(branches);
+                }
+            }
+
+            // Check if there's at least one branch common to all commits
+            if branch_sets.is_empty() {
+                false
+            } else {
+                let first_set = &branch_sets[0];
+                first_set
+                    .iter()
+                    .any(|branch| branch_sets.iter().skip(1).all(|set| set.contains(branch)))
+            }
+        } else {
+            true // Single commit is always "on same branch"
+        };
+
+        let can_squash = selected_count >= 2 && commits_on_same_branch;
+        let can_drop = selected_count >= 1 && (selected_count == 1 || commits_on_same_branch);
+
+        // Get commit data and ref_names for single selection
+        let (sha, message, author, ref_names) = if selected_count == 1 {
+            if let Some(idx) = self.selected_entry_idx {
+                if let Some(commit) = self.graph.commits.get(idx) {
+                    let repository = self
+                        .project
+                        .read_with(cx, |project, cx| project.active_repository(cx));
+
+                    let ref_names = commit.data.ref_names.clone();
+
+                    if let Some(repository) = repository {
+                        let data = repository.update(cx, |repository, cx| {
+                            repository.fetch_commit_data(commit.data.sha, cx).clone()
+                        });
+
+                        let sha = commit.data.sha.to_string();
+                        if let CommitDataState::Loaded(data) = data {
+                            let message = data.subject.to_string();
+                            let author = format!("{} <{}>", data.author_name, data.author_email);
+                            (Some(sha), Some(message), Some(author), ref_names)
+                        } else {
+                            (Some(sha), None, None, ref_names)
+                        }
+                    } else {
+                        (Some(commit.data.sha.to_string()), None, None, ref_names)
+                    }
+                } else {
+                    (None, None, None, Vec::new())
+                }
+            } else {
+                (None, None, None, Vec::new())
+            }
+        } else {
+            (None, None, None, Vec::new())
+        };
+
+        // Get the current branch name to avoid showing merge/rebase for current branch
+        let current_branch_name: Option<String> = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .and_then(|repo| repo.read(cx).branch.as_ref().map(|b| b.name().to_string()));
 
         let menu = ContextMenu::build(window, cx, |mut menu, _focus_handle, cx| {
-            // TODO: workspace::CopyPath doesn't exist - need to implement copy SHA functionality
-            menu = menu
-                .entry("Copy SHA", None, |_window, _cx| {
-                    // TODO: Implement copy SHA to clipboard
-                })
-                .separator();
+            // Copy options for single selection
+            if let Some(sha) = sha {
+                menu = menu.entry("Copy SHA", None, {
+                    move |_window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone()));
+                    }
+                });
+
+                if let Some(message) = message {
+                    menu = menu.entry("Copy Message", None, {
+                        move |_window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(message.clone()));
+                        }
+                    });
+                }
+
+                if let Some(author) = author {
+                    menu = menu.entry("Copy Author", None, {
+                        move |_window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(author.clone()));
+                        }
+                    });
+                }
+            }
+            menu = menu.separator();
+
+            // Checkout revision (single selection only)
+            if selected_count == 1 {
+                menu = menu.entry("Checkout Revision", None, |_window, cx| {
+                    cx.dispatch_action(&CheckoutRevision)
+                });
+            }
 
             if can_squash {
                 menu = menu.entry(
@@ -457,6 +968,265 @@ impl GitGraph {
                     None,
                     |_window, cx| cx.dispatch_action(&SquashCommits),
                 );
+            }
+
+            // Edit/amend commit (only for single selection)
+            if selected_count == 1 {
+                menu = menu.entry("Edit/Amend Commit...", None, |_window, cx| {
+                    cx.dispatch_action(&EditAmendCommit)
+                });
+            }
+
+            // Drop commits (dangerous operation) - only if commits are on the same branch
+            if can_drop {
+                menu = menu.separator().entry(
+                    if selected_count == 1 {
+                        "Drop Commit...".to_string()
+                    } else {
+                        format!("Drop {} Commits...", selected_count)
+                    },
+                    None,
+                    |_window, cx| cx.dispatch_action(&DropCommits),
+                );
+            }
+
+            // Reword commits
+            if selected_count >= 1 {
+                menu = menu.entry(
+                    if selected_count == 1 {
+                        "Reword Commit...".to_string()
+                    } else {
+                        format!("Reword {} Commits...", selected_count)
+                    },
+                    None,
+                    |_window, cx| cx.dispatch_action(&RewordCommits),
+                );
+            }
+
+            // Cherry-pick commits
+            if selected_count >= 1 {
+                menu = menu.entry(
+                    if selected_count == 1 {
+                        "Cherry-pick Commit".to_string()
+                    } else {
+                        format!("Cherry-pick {} Commits", selected_count)
+                    },
+                    None,
+                    |_window, cx| cx.dispatch_action(&CherryPick),
+                );
+            }
+
+            // Revert commits
+            if selected_count >= 1 {
+                menu = menu.entry(
+                    if selected_count == 1 {
+                        "Revert Commit...".to_string()
+                    } else {
+                        format!("Revert {} Commits...", selected_count)
+                    },
+                    None,
+                    |_window, cx| cx.dispatch_action(&RevertCommits),
+                );
+            }
+
+            // Branch operations for commits with branches/tags
+            if !ref_names.is_empty() {
+                menu = menu.separator();
+
+                for ref_name in ref_names.iter() {
+                    // Skip HEAD pointer
+                    if ref_name.as_ref() == "HEAD" {
+                        continue;
+                    }
+
+                    let (pretty_name, is_remote) = Self::prettify_branch_name(ref_name.as_ref());
+                    let branch_name: SharedString = ref_name.clone().into();
+                    let display_name = pretty_name.clone();
+
+                    // Check if this branch is the current branch
+                    let is_current_branch = current_branch_name
+                        .as_ref()
+                        .map(|current| current == &pretty_name)
+                        .unwrap_or(false);
+
+                    menu = menu.custom_entry(
+                        move |_window, _cx| {
+                            Label::new(format!("Branch: {}", display_name))
+                                .color(Color::Muted)
+                                .size(LabelSize::Small)
+                                .into_any_element()
+                        },
+                        |_, _| {},
+                    );
+
+                    // Don't show checkout for current branch
+                    if !is_current_branch {
+                        let checkout_display = pretty_name.clone();
+                        menu = menu.entry(format!("  Checkout '{}'", checkout_display), None, {
+                            let branch = branch_name.clone();
+                            move |_window, cx| {
+                                cx.dispatch_action(&SetContextBranch {
+                                    branch_name: branch.clone(),
+                                    is_remote,
+                                });
+                                cx.dispatch_action(&CheckoutBranch);
+                            }
+                        });
+                    }
+
+                    // Don't show merge/rebase for current branch (can't merge/rebase current into itself)
+                    if !is_remote && !is_current_branch {
+                        let merge_display = pretty_name.clone();
+                        menu = menu.entry(
+                            format!("  Merge '{}' into Current", merge_display),
+                            None,
+                            {
+                                let branch = branch_name.clone();
+                                move |_window, cx| {
+                                    cx.dispatch_action(&SetContextBranch {
+                                        branch_name: branch.clone(),
+                                        is_remote: false,
+                                    });
+                                    cx.dispatch_action(&MergeBranch);
+                                }
+                            },
+                        );
+
+                        let rebase_display = pretty_name.clone();
+                        menu = menu.entry(
+                            format!("  Rebase Current Onto '{}'", rebase_display),
+                            None,
+                            {
+                                let branch = branch_name.clone();
+                                move |_window, cx| {
+                                    cx.dispatch_action(&SetContextBranch {
+                                        branch_name: branch.clone(),
+                                        is_remote: false,
+                                    });
+                                    cx.dispatch_action(&RebaseOnto);
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Multi-commit branch operations (when 2+ commits with branches are selected)
+            if selected_count >= 2 && all_branches.len() >= 2 {
+                // Collect branch pairs with their pretty names and remote status
+                // (source_raw, source_pretty, is_source_remote, target_raw, target_pretty, is_target_remote)
+                let mut branch_pairs: Vec<(
+                    SharedString,
+                    String,
+                    bool,
+                    SharedString,
+                    String,
+                    bool,
+                )> = Vec::new();
+
+                // Get branches from first and second commits with branches
+                let first_branches = &all_branches[0].1;
+                let second_branches = &all_branches[1].1;
+
+                for first_branch in first_branches {
+                    let (first_pretty, is_first_remote) =
+                        Self::prettify_branch_name(first_branch.as_ref());
+
+                    for second_branch in second_branches {
+                        let (second_pretty, is_second_remote) =
+                            Self::prettify_branch_name(second_branch.as_ref());
+
+                        // Skip if both branches are the same
+                        if first_pretty == second_pretty {
+                            continue;
+                        }
+
+                        // Only allow operations between local branches or from remote to local
+                        if !is_first_remote || !is_second_remote {
+                            branch_pairs.push((
+                                first_branch.clone(),
+                                first_pretty.clone(),
+                                is_first_remote,
+                                second_branch.clone(),
+                                second_pretty.clone(),
+                                is_second_remote,
+                            ));
+                        }
+                    }
+                }
+
+                if !branch_pairs.is_empty() {
+                    menu = menu.separator();
+                    menu = menu.custom_entry(
+                        move |_window, _cx| {
+                            Label::new("Branch Operations")
+                                .color(Color::Muted)
+                                .size(LabelSize::Small)
+                                .into_any_element()
+                        },
+                        |_, _| {},
+                    );
+
+                    for (
+                        source_raw,
+                        source_pretty,
+                        is_source_remote,
+                        target_raw,
+                        target_pretty,
+                        is_target_remote,
+                    ) in branch_pairs
+                    {
+                        // Merge source into target (target must be local)
+                        if !is_target_remote {
+                            menu = menu.entry(
+                                format!("Merge '{}' into '{}'", source_pretty, target_pretty),
+                                None,
+                                {
+                                    let src = source_raw.clone();
+                                    let tgt = target_raw.clone();
+                                    move |_window, cx| {
+                                        // First checkout target, then merge source
+                                        cx.dispatch_action(&SetContextBranch {
+                                            branch_name: tgt.clone(),
+                                            is_remote: false,
+                                        });
+                                        cx.dispatch_action(&CheckoutBranch);
+                                        cx.dispatch_action(&SetContextBranch {
+                                            branch_name: src.clone(),
+                                            is_remote: is_source_remote,
+                                        });
+                                        cx.dispatch_action(&MergeBranch);
+                                    }
+                                },
+                            );
+                        }
+
+                        // Rebase source onto target (source must be local)
+                        if !is_source_remote {
+                            menu = menu.entry(
+                                format!("Rebase '{}' onto '{}'", source_pretty, target_pretty),
+                                None,
+                                {
+                                    let src = source_raw.clone();
+                                    let tgt = target_raw.clone();
+                                    move |_window, cx| {
+                                        // First checkout source, then rebase onto target
+                                        cx.dispatch_action(&SetContextBranch {
+                                            branch_name: src.clone(),
+                                            is_remote: false,
+                                        });
+                                        cx.dispatch_action(&CheckoutBranch);
+                                        cx.dispatch_action(&SetContextBranch {
+                                            branch_name: tgt.clone(),
+                                            is_remote: is_target_remote,
+                                        });
+                                        cx.dispatch_action(&RebaseOnto);
+                                    }
+                                },
+                            );
+                        }
+                    }
+                }
             }
 
             menu
@@ -477,22 +1247,20 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repository = self
-            .project
-            .read_with(cx, |project, cx| project.active_repository(cx));
+        self.perform_checkout(branch_name, false, window, cx);
+    }
 
-        let Some(repository) = repository else {
+    fn checkout_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Get the SHA of the selected commit
+        let Some(idx) = self.selected_entry_idx else {
+            return;
+        };
+        let Some(commit) = self.graph.commits.get(idx) else {
             return;
         };
 
-        // Check for uncommitted changes
-        let has_changes = false; // TODO: Check git status
-
-        if has_changes {
-            self.show_checkout_modal(branch_name, window, cx);
-        } else {
-            self.perform_checkout(branch_name, false, window, cx);
-        }
+        let sha: SharedString = commit.data.sha.to_string().into();
+        self.perform_checkout(sha, false, window, cx);
     }
 
     fn show_checkout_modal(
@@ -509,7 +1277,10 @@ impl GitGraph {
                     stash: true,
                 },
                 |action, window, cx| {
-                    if let ModalAction::CheckoutBranch { branch_name, stash, .. } = action {
+                    if let ModalAction::CheckoutBranch {
+                        branch_name, stash, ..
+                    } = action
+                    {
                         cx.emit(DismissEvent);
                         // Perform checkout will be called from the parent
                     }
@@ -538,18 +1309,24 @@ impl GitGraph {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
             // Stash if needed
             if stash_first {
                 let receiver = repository
                     .update(cx, |repo, _cx| {
-                        repo.stash_all(true, Some(format!("Auto-stash before checkout to {}", branch_name)))
+                        repo.stash_all(
+                            true,
+                            Some(format!("Auto-stash before checkout to {}", branch_name)),
+                        )
                     })
                     .unwrap();
 
                 match receiver.await {
                     Ok(()) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // Detached, can't return error
+                    }
                 }
             }
 
@@ -560,7 +1337,9 @@ impl GitGraph {
 
             match receiver.await {
                 Ok(()) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Detached, can't return error
+                }
             }
 
             // Unstash if we stashed
@@ -573,10 +1352,12 @@ impl GitGraph {
                 let _ = task.await;
             }
 
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                cx.notify();
-            })?;
+            weak_self
+                .update(cx, |this, cx| {
+                    this.graph.clear();
+                    cx.notify();
+                })
+                .ok();
 
             anyhow::Ok(())
         })
@@ -592,7 +1373,8 @@ impl GitGraph {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
             // Stash changes
             let receiver = repository
                 .update(cx, |repo, _cx| {
@@ -602,13 +1384,15 @@ impl GitGraph {
 
             match receiver.await {
                 Ok(()) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Detached, can't return error
+                }
             }
 
             // Pull with rebase (or merge based on settings)
             // TODO: Get rebase preference from settings
             // TODO: pull() is missing AskPassDelegate parameter - need proper integration
-            let rebase = true;
+            // let rebase = true;
             // Commented out until AskPassDelegate is properly integrated
             // let receiver = repository
             //     .update(cx, |repo, _cx| {
@@ -629,10 +1413,12 @@ impl GitGraph {
             // Ignore errors on unstash
             let _ = task.await;
 
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                cx.notify();
-            })?;
+            weak_self
+                .update(cx, |this, cx| {
+                    this.graph.clear();
+                    cx.notify();
+                })
+                .ok();
 
             anyhow::Ok(())
         })
@@ -679,20 +1465,25 @@ impl GitGraph {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
             let receiver = repository
                 .update(cx, |repo, _| repo.merge_branch(branch_name.to_string()))
                 .unwrap();
 
             match receiver.await {
-                Ok(()) => {}
-                Err(e) => return Err(e),
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
             }
-
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                cx.notify();
-            })?;
 
             anyhow::Ok(())
         })
@@ -738,20 +1529,25 @@ impl GitGraph {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
             let receiver = repository
                 .update(cx, |repo, _| repo.rebase_onto(target_branch.to_string()))
                 .unwrap();
 
             match receiver.await {
-                Ok(()) => {}
-                Err(e) => return Err(e),
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
             }
-
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                cx.notify();
-            })?;
 
             anyhow::Ok(())
         })
@@ -764,6 +1560,7 @@ impl GitGraph {
         }
 
         let commit_count = self.selected_entry_indices.len();
+        let git_graph = cx.weak_entity();
         let modal = cx.new(|cx| {
             GitModal::new(
                 ModalAction::SquashCommits {
@@ -772,6 +1569,11 @@ impl GitGraph {
                 },
                 move |action, window, cx| {
                     if let ModalAction::SquashCommits { message, .. } = action {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_squash(message.clone(), window, cx);
+                            });
+                        }
                         cx.emit(DismissEvent);
                     }
                 },
@@ -801,12 +1603,11 @@ impl GitGraph {
         let commit_shas: Vec<String> = self
             .selected_entry_indices
             .iter()
-            .filter_map(|&idx| {
-                self.graph.commits.get(idx).map(|c| c.data.sha.to_string())
-            })
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
             .collect();
 
-        cx.spawn(async move |this, cx| {
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
             let receiver = repository
                 .update(cx, |repo, _| {
                     repo.squash_commits(commit_shas, message.to_string())
@@ -814,15 +1615,426 @@ impl GitGraph {
                 .unwrap();
 
             match receiver.await {
-                Ok(()) => {}
-                Err(e) => return Err(e),
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
             }
 
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                this.selected_entry_indices.clear();
-                cx.notify();
-            })?;
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn drop_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.is_empty() {
+            return;
+        }
+
+        let commit_count = self.selected_entry_indices.len();
+        let git_graph = cx.weak_entity();
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::DropCommits { commit_count },
+                move |action, window, cx| {
+                    if let ModalAction::DropCommits { .. } = action {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_drop_commits(window, cx);
+                            });
+                        }
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_drop_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| repo.drop_commits(commit_shas))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn reword_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.is_empty() {
+            return;
+        }
+
+        let commit_count = self.selected_entry_indices.len();
+        let current_message: SharedString = "".into();
+
+        let git_graph = cx.weak_entity();
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::RewordCommits {
+                    commit_count,
+                    message: current_message.clone(),
+                },
+                move |action, window, cx| {
+                    if let ModalAction::RewordCommits { message, .. } = action {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_reword_commits(message.clone(), window, cx);
+                            });
+                        }
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_reword_commits(
+        &mut self,
+        new_message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| {
+                    repo.reword_commits(commit_shas, new_message.to_string())
+                })
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn edit_amend_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.len() != 1 {
+            return;
+        }
+
+        let idx = self.selected_entry_indices[0];
+        let Some(commit) = self.graph.commits.get(idx) else {
+            return;
+        };
+
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_data = repository.update(cx, |repository, cx| {
+            repository.fetch_commit_data(commit.data.sha, cx).clone()
+        });
+
+        let current_message = match commit_data {
+            CommitDataState::Loaded(data) => data.subject.clone(),
+            _ => "Loading...".into(),
+        };
+
+        let git_graph = cx.weak_entity();
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::EditAmendCommit {
+                    current_message: current_message.clone(),
+                    amend: true,
+                },
+                move |action, window, cx| {
+                    if let ModalAction::EditAmendCommit {
+                        current_message,
+                        amend,
+                    } = action
+                    {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_edit_amend_commit(
+                                    current_message.clone(),
+                                    amend,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_edit_amend_commit(
+        &mut self,
+        message: SharedString,
+        amend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            if amend {
+                // Edit commits (allows changing files and message)
+                let receiver = repository
+                    .update(cx, |repo, _| repo.edit_commits(commit_shas))
+                    .unwrap();
+
+                match receiver.await {
+                    Ok(()) => {
+                        weak_self
+                            .update(cx, |this, cx| {
+                                this.graph.clear();
+                                this.selected_entry_indices.clear();
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    Err(e) => {
+                        // Detached, can't return error
+                    }
+                }
+            } else {
+                // Reword commits (change message only)
+                let receiver = repository
+                    .update(cx, |repo, _| {
+                        repo.reword_commits(commit_shas, message.to_string())
+                    })
+                    .unwrap();
+
+                match receiver.await {
+                    Ok(()) => {
+                        weak_self
+                            .update(cx, |this, cx| {
+                                this.graph.clear();
+                                this.selected_entry_indices.clear();
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    Err(e) => {
+                        // Detached, can't return error
+                    }
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn cherry_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.is_empty() {
+            return;
+        }
+
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| repo.cherry_pick(commit_shas))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // TODO: Handle cherry-pick conflicts
+                    // For now, just ignore the error
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn revert_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_entry_indices.is_empty() {
+            return;
+        }
+
+        let commit_count = self.selected_entry_indices.len();
+        let git_graph = cx.weak_entity();
+        let modal = cx.new(|cx| {
+            GitModal::new(
+                ModalAction::RevertCommits { commit_count },
+                move |action, window, cx| {
+                    if let ModalAction::RevertCommits { .. } = action {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_revert_commits(window, cx);
+                            });
+                        }
+                        cx.emit(DismissEvent);
+                    }
+                },
+                window,
+                cx,
+            )
+        });
+
+        self.modal = Some(modal);
+        cx.notify();
+    }
+
+    fn perform_revert_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let commit_shas: Vec<String> = self
+            .selected_entry_indices
+            .iter()
+            .filter_map(|&idx| self.graph.commits.get(idx).map(|c| c.data.sha.to_string()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = repository
+                .update(cx, |repo, _| repo.revert_commits(commit_shas))
+                .unwrap();
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("conflicts detected") {
+                        // TODO: Handle revert conflicts
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
 
             anyhow::Ok(())
         })
@@ -836,6 +2048,7 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let git_graph = cx.weak_entity();
         let modal = cx.new(|cx| {
             GitModal::new(
                 ModalAction::DeleteBranch {
@@ -850,6 +2063,16 @@ impl GitGraph {
                         delete_remote,
                     } = action
                     {
+                        if let Some(git_graph) = git_graph.upgrade() {
+                            git_graph.update(cx, |git_graph, cx| {
+                                git_graph.perform_delete_branch(
+                                    branch_name,
+                                    delete_remote,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
                         cx.emit(DismissEvent);
                     }
                 },
@@ -877,37 +2100,52 @@ impl GitGraph {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
-            // Delete local branch
-            let receiver = repository
-                .update(cx, |repo, _| repo.delete_branch(branch_name.to_string()))
-                .unwrap();
+        let selected_branches = self.selected_branches.clone();
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let branches_to_delete = if !selected_branches.is_empty() {
+                selected_branches
+            } else {
+                vec![branch_name.clone()]
+            };
 
-            match receiver.await {
-                Ok(()) => {}
-                Err(e) => return Err(e),
+            for branch in branches_to_delete {
+                // Delete local branch
+                let receiver = repository
+                    .update(cx, |repo, _| repo.delete_branch(branch.to_string()))
+                    .unwrap();
+
+                match receiver.await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Detached, can't return error
+                    }
+                }
+
+                // Delete remote branch if requested
+                if delete_remote {
+                    // TODO: delete_remote_branch is missing parameters - need proper integration
+                    // Commented out until properly integrated
+                    // let receiver = repository
+                    //     .update(cx, |repo, _cx| {
+                    //         repo.delete_remote_branch("origin".into(), branch.to_string())
+                    //     })
+                    //     .unwrap();
+                    //
+                    // match receiver.await {
+                    //     Ok(()) => {}
+                    //     Err(e) => return Err(e),
+                    // }
+                }
             }
 
-            // Delete remote branch if requested
-            if delete_remote {
-                // TODO: delete_remote_branch is missing parameters - need proper integration
-                // Commented out until properly integrated
-                // let receiver = repository
-                //     .update(cx, |repo, _cx| {
-                //         repo.delete_remote_branch("origin".into(), branch_name.to_string())
-                //     })
-                //     .unwrap();
-                //
-                // match receiver.await {
-                //     Ok(()) => {}
-                //     Err(e) => return Err(e),
-                // }
-            }
-
-            this.update(cx, |this, cx| {
-                this.graph.clear();
-                cx.notify();
-            })?;
+            weak_self
+                .update(cx, |this, cx: &mut Context<Self>| {
+                    this.graph.clear();
+                    this.selected_branches.clear();
+                    cx.notify();
+                })
+                .ok();
 
             anyhow::Ok(())
         })
@@ -934,7 +2172,7 @@ impl GitGraph {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let Some(selected_idx) = self.selected_entry_idx else {
             return div().into_any_element();
         };
@@ -951,7 +2189,7 @@ impl GitGraph {
             return div().into_any_element();
         };
 
-        let data = repository.update(cx, |repository, cx| {
+        let commit_data = repository.update(cx, |repository, cx| {
             repository
                 .fetch_commit_data(commit_entry.data.sha, cx)
                 .clone()
@@ -974,15 +2212,17 @@ impl GitGraph {
             .copied()
             .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
 
-        let (author_name, author_email, commit_timestamp, subject) = match &data {
-            CommitDataState::Loaded(data) => (
-                data.author_name.clone(),
-                data.author_email.clone(),
-                Some(data.commit_timestamp),
-                data.subject.clone(),
-            ),
-            CommitDataState::Loading => ("Loading...".into(), "".into(), None, "Loading...".into()),
-        };
+        let (author_name, author_email, commit_timestamp, subject) =
+            if let CommitDataState::Loaded(data) = commit_data {
+                (
+                    data.author_name.clone(),
+                    data.author_email.clone(),
+                    Some(data.commit_timestamp),
+                    data.subject.clone(),
+                )
+            } else {
+                ("Loading...".into(), "".into(), None, "Loading...".into())
+            };
 
         let date_string = commit_timestamp
             .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
@@ -1028,7 +2268,7 @@ impl GitGraph {
             .map(|diff| diff.files.len())
             .unwrap_or(0);
 
-        v_flex()
+        let content = v_flex()
             .w(px(300.))
             .h_full()
             .border_l_1()
@@ -1042,7 +2282,7 @@ impl GitGraph {
                         h_flex().justify_between().child(avatar).child(
                             IconButton::new("close-detail", IconName::Close)
                                 .icon_size(IconSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
                                     this.selected_entry_idx = None;
                                     this.selected_commit_diff = None;
                                     this._commit_diff_task = None;
@@ -1064,7 +2304,8 @@ impl GitGraph {
                         h_flex().gap_1().flex_wrap().children(
                             ref_names
                                 .iter()
-                                .map(|name| self.render_badge(name, accent_color, cx)),
+                                .map(|name| self.render_badge(name, accent_color, cx))
+                                .collect::<Vec<_>>(),
                         )
                     }))
                     .child(
@@ -1109,11 +2350,15 @@ impl GitGraph {
                                                 "Copy SHA: {}",
                                                 copy_sha
                                             )))
-                                            .on_click(move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    copy_sha.to_string(),
-                                                ));
-                                            })
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(
+                                                            copy_sha.to_string(),
+                                                        ),
+                                                    );
+                                                },
+                                            ))
                                     }),
                             )
                             .when_some(remote.clone(), |this, remote| {
@@ -1150,9 +2395,9 @@ impl GitGraph {
                                             .label_size(LabelSize::Small)
                                             .color(Color::Muted)
                                             .on_click(
-                                                move |_, _, cx| {
+                                                cx.listener(move |this, _event, _window, cx| {
                                                     cx.open_url(&url);
-                                                },
+                                                }),
                                             ),
                                         ),
                                 )
@@ -1169,7 +2414,12 @@ impl GitGraph {
                                         Button::new("uncommit", "Uncommit")
                                             .style(ButtonStyle::Transparent)
                                             .label_size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                            .color(Color::Muted)
+                                            .on_click(cx.listener(
+                                                move |this, _event, _window, cx| {
+                                                    // TODO: Implement uncommit
+                                                },
+                                            )),
                                     ),
                             ),
                     ),
@@ -1200,22 +2450,94 @@ impl GitGraph {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
-                            .children(self.selected_commit_diff.as_ref().map(|diff| {
-                                v_flex().gap_1().children(diff.files.iter().map(|file| {
-                                    let file_name: String = file
-                                        .path
-                                        .file_name()
-                                        .map(|n| n.to_string())
-                                        .unwrap_or_default();
-                                    let dir_path: String = file
-                                        .path
-                                        .parent()
-                                        .map(|p| p.as_unix_str().to_string())
-                                        .unwrap_or_default();
+                            .child({
+                                if let Some(diff) = self.selected_commit_diff.as_ref() {
+                                    let tree = self.build_file_tree(&diff.files);
+                                    self.render_file_tree(&tree, cx)
+                                } else {
+                                    div().into_any_element()
+                                }
+                            }),
+                    ),
+            )
+            .into_any_element();
+        return content;
+    }
 
+    fn build_file_tree(&self, files: &[CommitFile]) -> TreeNode {
+        let mut root = TreeNode {
+            children: HashMap::new(),
+            file: None,
+        };
+
+        for file in files {
+            let path = file.path.as_std_path();
+            let mut current = &mut root;
+            for component in path.components() {
+                if let std::path::Component::Normal(name) = component {
+                    let name_str = name.to_string_lossy().to_string();
+                    current = current.children.entry(name_str).or_insert(TreeNode {
+                        children: HashMap::new(),
+                        file: None,
+                    });
+                }
+            }
+            current.file = Some(CommitFile {
+                path: file.path.clone(),
+                old_text: file.old_text.clone(),
+                new_text: file.new_text.clone(),
+                is_binary: file.is_binary,
+            });
+        }
+
+        root
+    }
+
+    fn render_file_tree(&self, node: &TreeNode, cx: &Context<Self>) -> AnyElement {
+        v_flex()
+            .children(
+                node.children
+                    .iter()
+                    .map(|(name, child)| {
+                        if child.file.is_some() {
+                            // It's a file
+                            let file = child.file.as_ref().unwrap();
+                            let file_name = file
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string())
+                                .unwrap_or_default();
+
+                            let content_element = if file.is_binary {
+                                Label::new("Binary file")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .into_any_element()
+                            } else if let Some(content) = &file.new_text {
+                                div()
+                                    .bg(cx.theme().colors().editor_background)
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .p_2()
+                                    .rounded_sm()
+                                    .max_h(px(200.))
+                                    .child(
+                                        Label::new(content.clone())
+                                            .size(LabelSize::Small)
+                                            .single_line(),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                Label::new("No content")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .into_any_element()
+                            };
+                            v_flex()
+                                .gap_1()
+                                .child(
                                     h_flex()
                                         .gap_1()
-                                        .overflow_hidden()
                                         .child(
                                             Icon::new(IconName::File)
                                                 .size(IconSize::Small)
@@ -1224,19 +2546,33 @@ impl GitGraph {
                                         .child(
                                             Label::new(file_name)
                                                 .size(LabelSize::Small)
-                                                .single_line(),
+                                                .weight(FontWeight::BOLD),
+                                        ),
+                                )
+                                .child(content_element)
+                                .into_any_element()
+                        } else {
+                            // It's a directory
+                            div()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(IconName::Folder)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
                                         )
-                                        .when(!dir_path.is_empty(), |this| {
-                                            this.child(
-                                                Label::new(dir_path)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                                    .single_line(),
-                                            )
-                                        })
-                                }))
-                            })),
-                    ),
+                                        .child(
+                                            Label::new(name.clone())
+                                                .size(LabelSize::Small)
+                                                .weight(FontWeight::BOLD),
+                                        ),
+                                )
+                                .child(div().pl_4().child(self.render_file_tree(child, cx)))
+                                .into_any_element()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
             )
             .into_any_element()
     }
@@ -1319,7 +2655,7 @@ impl Render for GitGraph {
                 .child(
                     IconButton::new("dismiss-error", IconName::Close)
                         .icon_size(IconSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _event, _window, cx| {
                             this.error = None;
                             cx.notify();
                         })),
@@ -1384,12 +2720,26 @@ impl Render for GitGraph {
                                 .flex_1()
                                 .overflow_hidden()
                                 .child(render_graph(&self, cx))
-                                .on_scroll_wheel(cx.listener(Self::handle_graph_scroll)),
+                                .on_scroll_wheel(cx.listener(Self::handle_graph_scroll))
+                                .on_mouse_down(gpui::MouseButton::Right, {
+                                    let weak_self = cx.weak_entity();
+                                    move |event: &gpui::MouseDownEvent, window, cx| {
+                                        weak_self
+                                            .update(cx, |this, cx| {
+                                                this.show_context_menu_for_commits(
+                                                    event.position,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                }),
                         ),
                 )
                 .child({
                     let row_height = self.row_height;
-                    let selected_entry_idx = self.selected_entry_idx;
+                    let selected_entry_indices = self.selected_entry_indices.clone();
                     let weak_self = cx.weak_entity();
                     div().flex_1().size_full().child(
                         Table::new(4)
@@ -1412,20 +2762,76 @@ impl Render for GitGraph {
                                 ]
                                 .to_vec(),
                             )
-                            .map_row(move |(index, row), _window, cx| {
-                                let is_selected = selected_entry_idx == Some(index);
-                                let weak = weak_self.clone();
-                                row.h(row_height)
-                                    .when(is_selected, |row| {
-                                        row.bg(cx.theme().colors().element_selected)
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        weak.update(cx, |this, cx| {
-                                            this.select_entry(index, cx);
+                            .map_row({
+                                let weak_self = weak_self.clone();
+                                let selected_entry_indices = selected_entry_indices.clone();
+                                move |(index, row), _window, row_cx| {
+                                    let is_selected = selected_entry_indices.contains(&index);
+                                    let weak = weak_self.clone();
+                                    row.h(row_height)
+                                        .when(is_selected, |row| {
+                                            row.bg(row_cx.theme().colors().element_selected)
                                         })
-                                        .ok();
-                                    })
-                                    .into_any_element()
+                                        .on_mouse_down(gpui::MouseButton::Left, {
+                                            move |event: &gpui::MouseDownEvent, window, cx| {
+                                                weak.update(cx, |this, cx| {
+                                                    if event.modifiers.secondary() {
+                                                        // Multi-select mode: toggle selection
+                                                        if let Some(pos) = this
+                                                            .selected_entry_indices
+                                                            .iter()
+                                                            .position(|&i| i == index)
+                                                        {
+                                                            this.selected_entry_indices.remove(pos);
+                                                            if this.selected_entry_idx
+                                                                == Some(index)
+                                                            {
+                                                                this.selected_entry_idx = this
+                                                                    .selected_entry_indices
+                                                                    .last()
+                                                                    .copied();
+                                                            }
+                                                        } else {
+                                                            this.selected_entry_indices.push(index);
+                                                            this.selected_entry_idx = Some(index);
+                                                        }
+                                                        this.selected_commit_diff = None;
+                                                        this._commit_diff_task = None;
+                                                    } else {
+                                                        // Single-select mode: clear and select only this one
+                                                        this.selected_entry_indices.clear();
+                                                        this.selected_entry_indices.push(index);
+                                                        this.select_entry(index, cx);
+                                                    }
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            }
+                                        })
+                                        .on_mouse_down(gpui::MouseButton::Right, {
+                                            let weak = weak_self.clone();
+                                            move |event: &gpui::MouseDownEvent, window, cx| {
+                                                weak.update(cx, |this, cx| {
+                                                    // If the clicked row is not already selected, select it exclusively
+                                                    if !this.selected_entry_indices.contains(&index)
+                                                    {
+                                                        this.selected_entry_indices.clear();
+                                                        this.selected_entry_indices.push(index);
+                                                        this.select_entry(index, cx);
+                                                    }
+
+                                                    this.show_context_menu_for_commits(
+                                                        event.position,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            }
+                                        })
+                                        .into_any_element()
+                                }
                             })
                             .uniform_list(
                                 "git-graph-commits",
@@ -1444,12 +2850,6 @@ impl Render for GitGraph {
             .bg(cx.theme().colors().editor_background)
             .key_context("GitGraph")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::handle_checkout_branch_action))
-            .on_action(cx.listener(Self::handle_pull_with_stash_action))
-            .on_action(cx.listener(Self::handle_merge_branch_action))
-            .on_action(cx.listener(Self::handle_rebase_onto_action))
-            .on_action(cx.listener(Self::handle_squash_commits_action))
-            .on_action(cx.listener(Self::handle_delete_branch_action))
             .child(v_flex().size_full().children(error_banner).child(content))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
@@ -1471,7 +2871,7 @@ impl Render for GitGraph {
                         .items_center()
                         .justify_center()
                         .bg(gpui::black().opacity(0.5))
-                        .child(modal.clone())
+                        .child(modal.clone()),
                 )
                 .with_priority(2)
             }))
@@ -1538,6 +2938,33 @@ impl GitGraph {
         self.squash_commits(window, cx);
     }
 
+    fn handle_drop_commits_action(
+        &mut self,
+        _: &DropCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_commits(window, cx);
+    }
+
+    fn handle_reword_commits_action(
+        &mut self,
+        _: &RewordCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reword_commits(window, cx);
+    }
+
+    fn handle_edit_amend_commit_action(
+        &mut self,
+        _: &EditAmendCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_amend_commit(window, cx);
+    }
+
     fn handle_delete_branch_action(
         &mut self,
         _: &DeleteBranch,
@@ -1548,6 +2975,111 @@ impl GitGraph {
             let is_remote = self.context_is_remote;
             self.delete_branch(branch_name, is_remote, window, cx);
         }
+    }
+
+    fn handle_cherry_pick_action(
+        &mut self,
+        _: &CherryPick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cherry_pick(window, cx);
+    }
+
+    fn handle_cherry_pick_conflict(
+        &mut self,
+        abort: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = if abort {
+                repository
+                    .update(cx, |repo, _| repo.abort_cherry_pick())
+                    .unwrap()
+            } else {
+                repository
+                    .update(cx, |repo, _| repo.continue_cherry_pick())
+                    .unwrap()
+            };
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn handle_revert_conflict(&mut self, abort: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self
+            .project
+            .read_with(cx, |project, cx| project.active_repository(cx));
+
+        let Some(repository) = repository else {
+            return;
+        };
+
+        let weak_self = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let receiver = if abort {
+                repository
+                    .update(cx, |repo, _| repo.abort_revert())
+                    .unwrap()
+            } else {
+                repository
+                    .update(cx, |repo, _| repo.continue_revert())
+                    .unwrap()
+            };
+
+            match receiver.await {
+                Ok(()) => {
+                    weak_self
+                        .update(cx, |this, cx| {
+                            this.graph.clear();
+                            this.selected_entry_indices.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(e) => {
+                    // Detached, can't return error
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn handle_revert_commits_action(
+        &mut self,
+        _: &RevertCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.revert_commits(window, cx);
     }
 }
 

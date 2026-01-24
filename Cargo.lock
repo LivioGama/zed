@@ -7197,6 +7197,8 @@ dependencies = [
  "itertools 0.14.0",
  "menu",
  "project",
+ "schemars 1.0.4",
+ "serde",
  "settings",
  "smallvec",
  "theme",

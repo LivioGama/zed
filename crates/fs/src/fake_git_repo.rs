@@ -498,6 +498,66 @@ impl GitRepository for FakeGitRepository {
         async { Ok(()) }.boxed()
     }
 
+    fn drop_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn reword_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _new_message: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn edit_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn revert_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn abort_cherry_pick(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn continue_cherry_pick(
+        &self,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn abort_revert(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn continue_revert(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
     fn stash_all(
         &self,
         _include_untracked: bool,

@@ -652,6 +652,45 @@ pub trait GitRepository: Send + Sync {
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    fn drop_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn reword_commits(
+        &self,
+        commit_shas: Vec<String>,
+        new_message: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn cherry_pick(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn abort_cherry_pick(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    fn continue_cherry_pick(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    fn revert_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn abort_revert(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    fn continue_revert(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    fn edit_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
     fn stash_all(
         &self,
         include_untracked: bool,
@@ -1872,6 +1911,364 @@ impl GitRepository for RealGitRepository {
 
                 // Amend with the new message
                 git.run(&["commit", "--amend", "-m", &message]).await?;
+
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn drop_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                if commit_shas.is_empty() {
+                    return Ok(());
+                }
+
+                let working_dir = working_directory?;
+
+                // Find the parent of the oldest commit
+                let oldest_commit = &commit_shas[commit_shas.len() - 1];
+                let git = GitBinary::new(
+                    git_binary_path.clone(),
+                    working_dir.clone(),
+                    executor.clone(),
+                );
+                let parent = git
+                    .run(&["rev-parse", &format!("{}^", oldest_commit)])
+                    .await?;
+                let parent = parent.trim();
+
+                // Create a rebase script that drops all commits
+                let mut rebase_script = String::new();
+                for sha in commit_shas.iter().rev() {
+                    rebase_script.push_str(&format!("drop {}\n", sha));
+                }
+
+                // Write the script to a temporary file and run rebase
+                let script_path = std::env::temp_dir()
+                    .join(format!("git-rebase-script-{}", uuid::Uuid::new_v4()));
+                std::fs::write(&script_path, rebase_script)?;
+
+                // Set environment variables for the rebase
+                let mut command = new_smol_command(&git_binary_path);
+                command
+                    .current_dir(&working_dir)
+                    .envs(env.iter())
+                    .env(
+                        "GIT_SEQUENCE_EDITOR",
+                        format!("cp {} $1", script_path.display()),
+                    )
+                    .env("GIT_EDITOR", "true")
+                    .args(["rebase", "-i", parent])
+                    .output()
+                    .await?;
+
+                // Clean up
+                let _ = std::fs::remove_file(script_path);
+
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn reword_commits(
+        &self,
+        commit_shas: Vec<String>,
+        new_message: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                if commit_shas.is_empty() {
+                    return Ok(());
+                }
+
+                let working_dir = working_directory?;
+
+                // Find the parent of the oldest commit
+                let oldest_commit = &commit_shas[commit_shas.len() - 1];
+                let git = GitBinary::new(
+                    git_binary_path.clone(),
+                    working_dir.clone(),
+                    executor.clone(),
+                );
+                let parent = git
+                    .run(&["rev-parse", &format!("{}^", oldest_commit)])
+                    .await?;
+                let parent = parent.trim();
+
+                // Create a rebase script that rewords all commits
+                let mut rebase_script = String::new();
+                for (i, sha) in commit_shas.iter().rev().enumerate() {
+                    if i == 0 {
+                        rebase_script.push_str(&format!("pick {}\n", sha));
+                    } else {
+                        rebase_script.push_str(&format!("reword {}\n", sha));
+                    }
+                }
+
+                // Write the script to a temporary file and run rebase
+                let script_path = std::env::temp_dir()
+                    .join(format!("git-rebase-script-{}", uuid::Uuid::new_v4()));
+                std::fs::write(&script_path, rebase_script)?;
+
+                // Create a script for GIT_EDITOR that outputs the new_message
+                let editor_script_path = std::env::temp_dir()
+                    .join(format!("git-editor-script-{}", uuid::Uuid::new_v4()));
+                let editor_script = format!("#!/bin/sh\ncat > $1 << 'EOF'\n{}\nEOF\n", new_message);
+                std::fs::write(&editor_script_path, editor_script)?;
+
+                // Make it executable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(&editor_script_path)?.permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&editor_script_path, perms)?;
+                }
+
+                // Set environment variables for the rebase
+                let mut command = new_smol_command(&git_binary_path);
+                command
+                    .current_dir(&working_dir)
+                    .envs(env.iter())
+                    .env(
+                        "GIT_SEQUENCE_EDITOR",
+                        format!("cp {} $1", script_path.display()),
+                    )
+                    .env(
+                        "GIT_EDITOR",
+                        editor_script_path.to_string_lossy().to_string(),
+                    )
+                    .args(["rebase", "-i", parent])
+                    .output()
+                    .await?;
+
+                // Clean up
+                let _ = std::fs::remove_file(script_path);
+                let _ = std::fs::remove_file(editor_script_path);
+
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                if commit_shas.is_empty() {
+                    return Ok(());
+                }
+
+                let working_dir = working_directory?;
+                let git = GitBinary::new(
+                    git_binary_path.clone(),
+                    working_dir.clone(),
+                    executor.clone(),
+                );
+
+                let mut args = vec!["cherry-pick"];
+                args.extend(commit_shas.iter().map(|s| s.as_str()));
+
+                let result = git.run(&args).await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // Check if conflicts occurred by looking for CHERRY_PICK_HEAD
+                        let cherry_pick_head = working_dir.join(".git/CHERRY_PICK_HEAD");
+                        if smol::fs::metadata(&cherry_pick_head).await.is_ok() {
+                            Err(anyhow!("Cherry-pick conflicts detected"))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            })
+            .boxed()
+    }
+
+    fn abort_cherry_pick(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                let working_dir = working_directory?;
+                let git = GitBinary::new(git_binary_path, working_dir, executor);
+                git.run(&["cherry-pick", "--abort"]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn continue_cherry_pick(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                let working_dir = working_directory?;
+                let git = GitBinary::new(git_binary_path, working_dir, executor);
+                git.run(&["cherry-pick", "--continue"]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn revert_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                if commit_shas.is_empty() {
+                    return Ok(());
+                }
+
+                let working_dir = working_directory?;
+                let git = GitBinary::new(
+                    git_binary_path.clone(),
+                    working_dir.clone(),
+                    executor.clone(),
+                );
+
+                let mut args = vec!["revert", "--no-edit"];
+                args.extend(commit_shas.iter().map(|s| s.as_str()));
+
+                let result = git.run(&args).await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // Check if conflicts occurred by looking for REVERT_HEAD
+                        let revert_head = working_dir.join(".git/REVERT_HEAD");
+                        if smol::fs::metadata(&revert_head).await.is_ok() {
+                            Err(anyhow!("Revert conflicts detected"))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            })
+            .boxed()
+    }
+
+    fn abort_revert(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                let working_dir = working_directory?;
+                let git = GitBinary::new(git_binary_path, working_dir, executor);
+                git.run(&["revert", "--abort"]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn continue_revert(&self, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                let working_dir = working_directory?;
+                let git = GitBinary::new(git_binary_path, working_dir, executor);
+                git.run(&["revert", "--continue"]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn edit_commits(
+        &self,
+        commit_shas: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary_path = self.any_git_binary_path.clone();
+        let working_directory = self.working_directory();
+        let executor = self.executor.clone();
+
+        self.executor
+            .spawn(async move {
+                if commit_shas.is_empty() {
+                    return Ok(());
+                }
+
+                let working_dir = working_directory?;
+
+                // Find the parent of the oldest commit
+                let oldest_commit = &commit_shas[commit_shas.len() - 1];
+                let git = GitBinary::new(
+                    git_binary_path.clone(),
+                    working_dir.clone(),
+                    executor.clone(),
+                );
+                let parent = git
+                    .run(&["rev-parse", &format!("{}^", oldest_commit)])
+                    .await?;
+                let parent = parent.trim();
+
+                // Create a rebase script that edits all commits
+                let mut rebase_script = String::new();
+                for (i, sha) in commit_shas.iter().rev().enumerate() {
+                    if i == 0 {
+                        rebase_script.push_str(&format!("pick {}\n", sha));
+                    } else {
+                        rebase_script.push_str(&format!("edit {}\n", sha));
+                    }
+                }
+
+                // Write the script to a temporary file and run rebase
+                let script_path = std::env::temp_dir()
+                    .join(format!("git-rebase-script-{}", uuid::Uuid::new_v4()));
+                std::fs::write(&script_path, rebase_script)?;
+
+                // Set environment variables for the rebase
+                let mut command = new_smol_command(&git_binary_path);
+                command
+                    .current_dir(&working_dir)
+                    .envs(env.iter())
+                    .env(
+                        "GIT_SEQUENCE_EDITOR",
+                        format!("cp {} $1", script_path.display()),
+                    )
+                    .env("GIT_EDITOR", "true")
+                    .args(["rebase", "-i", parent])
+                    .output()
+                    .await?;
+
+                // Clean up
+                let _ = std::fs::remove_file(script_path);
 
                 anyhow::Ok(())
             })

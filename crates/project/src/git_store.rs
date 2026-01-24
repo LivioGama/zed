@@ -5716,6 +5716,189 @@ impl Repository {
         )
     }
 
+    pub fn drop_commits(&mut self, commit_shas: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git rebase -i (drop {} commits)", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.drop_commits(commit_shas, environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Drop commits not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn reword_commits(
+        &mut self,
+        commit_shas: Vec<String>,
+        message: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git rebase -i (reword {} commits)", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .reword_commits(commit_shas, message, environment.clone())
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Reword commits not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn edit_commits(&mut self, commit_shas: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git rebase -i (edit {} commits)", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.edit_commits(commit_shas, environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Edit commits not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn cherry_pick(&mut self, commit_shas: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git cherry-pick {} commits", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.cherry_pick(commit_shas, environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Cherry-pick not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn revert_commits(&mut self, commit_shas: Vec<String>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some(format!("git revert {} commits", commit_shas.len()).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .revert_commits(commit_shas, environment.clone())
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Revert not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn abort_cherry_pick(&mut self) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some("git cherry-pick --abort".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.abort_cherry_pick(environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Abort cherry-pick not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn continue_cherry_pick(&mut self) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some("git cherry-pick --continue".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.continue_cherry_pick(environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Continue cherry-pick not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn abort_revert(&mut self) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some("git revert --abort".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.abort_revert(environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Abort revert not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn continue_revert(&mut self) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some("git revert --continue".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.continue_revert(environment.clone()).await,
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("Continue revert not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
     pub fn stash_all(
         &mut self,
         include_untracked: bool,

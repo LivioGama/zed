@@ -55,6 +55,16 @@
     },
   },
   {
+    "context": "GitGraph",
+    "use_key_equivalents": true,
+    "bindings": {
+      "up": "git_graph::SelectPreviousCommit",
+      "down": "git_graph::SelectNextCommit",
+      "shift-up": "git_graph::SelectPreviousCommitExtend",
+      "shift-down": "git_graph::SelectNextCommitExtend",
+    },
+  },
+  {
     "context": "menu",
     "bindings": {
       "right": "menu::SelectChild",
