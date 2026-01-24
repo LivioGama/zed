@@ -27,6 +27,18 @@ use workspace::item::Item;
 
 const DIFF_HIGHLIGHT_ALPHA: f32 = 0.5;
 
+fn calc_collapsed_offset(regions: &[CollapsedRegion], base_row: f32) -> f32 {
+    let mut offset: f32 = 0.0;
+    for region in regions {
+        if region.end_line as f32 <= base_row {
+            let lines_hidden = (region.end_line - region.start_line) as f32;
+            let visual_height = 1.0;
+            offset += lines_hidden - visual_height;
+        }
+    }
+    offset
+}
+
 fn get_diff_colors(cx: &Context<DiffViewer>) -> (Hsla, Hsla, Hsla) {
     let theme = cx.theme();
     let mut deleted_bg = theme.status().deleted_background;

@@ -1,139 +1,391 @@
-# Rust coding guidelines
 
-* Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
-* Do not write organizational or comments that summarize the code. Comments should only be written in order to explain "why" the code is written in some way in the case there is a reason that is tricky / non-obvious.
-* Prefer implementing functionality in existing files unless it is a new logical component. Avoid creating many small files.
-* Avoid using functions that panic like `unwrap()`, instead use mechanisms like `?` to propagate errors.
-* Be careful with operations like indexing which may panic if the indexes are out of bounds.
-* Never silently discard errors with `let _ =` on fallible operations. Always handle errors appropriately:
-  - Propagate errors with `?` when the calling function should handle them
-  - Use `.log_err()` or similar when you need to ignore errors but want visibility
-  - Use explicit error handling with `match` or `if let Err(...)` when you need custom logic
-  - Example: avoid `let _ = client.request(...).await?;` - use `client.request(...).await?;` instead
-* When implementing async operations that may fail, ensure errors propagate to the UI layer so users get meaningful feedback.
-* Never create files with `mod.rs` paths - prefer `src/some_module.rs` instead of `src/some_module/mod.rs`.
-* When creating new crates, prefer specifying the library root path in `Cargo.toml` using `[lib] path = "...rs"` instead of the default `lib.rs`, to maintain consistent and descriptive naming (e.g., `gpui.rs` or `main.rs`).
-* Avoid creative additions unless explicitly requested
-* Use full words for variable names (no abbreviations like "q" for "queue")
-* Use variable shadowing to scope clones in async contexts for clarity, minimizing the lifetime of borrowed references.
-  Example:
-  ```rust
-  executor.spawn({
-      let task_ran = task_ran.clone();
-      async move {
-          *task_ran.borrow_mut() = true;
-      }
-  });
-  ```
+## CRITICAL: Zero-Reset Mandate
 
-# Timers in tests
+I have NO memory between sessions. My memory resets completely at session start. The Memory Bank in `.memory-bank/` is my ONLY link to previous work. I MUST read it before doing anything else.
 
-* In GPUI tests, prefer GPUI executor timers over `smol::Timer::after(...)` when you need timeouts, delays, or to drive `run_until_parked()`:
-  - Use `cx.background_executor().timer(duration).await` (or `cx.background_executor.timer(duration).await` in `TestAppContext`) so the work is scheduled on GPUI's dispatcher.
-  - Avoid `smol::Timer::after(...)` for test timeouts when you rely on `run_until_parked()`, because it may not be tracked by GPUI's scheduler and can lead to "nothing left to run" when pumping.
+---
 
-# GPUI
+## Task Start Protocol (MANDATORY - EVERY TASK)
 
-GPUI is a UI framework which also provides primitives for state and concurrency management.
+At the start of EVERY task, I MUST:
 
-## Context
+1. **Read Memory Bank files** (in order):
+   - `.memory-bank/02-CURRENT-STATE.md`
+   - `.memory-bank/03-CONSTRAINTS.md`
+   - `.memory-bank/00-PROJECT-BRIEF.md`
 
-Context types allow interaction with global state, windows, entities, and system services. They are typically passed to functions as the argument named `cx`. When a function takes callbacks they come after the `cx` parameter.
+2. **Sync Audit**:
+   - Compare the last entry in `.memory-bank/99-CHANGELOG.md` against timestamps of modified source files.
+   - If Memory Bank docs are stale relative to code changes, recommend `/update` before proceeding.
 
-* `App` is the root context type, providing access to global state and read and update of entities.
-* `Context<T>` is provided when updating an `Entity<T>`. This context dereferences into `App`, so functions which take `&App` can also take `&Context<T>`.
-* `AsyncApp` and `AsyncWindowContext` are provided by `cx.spawn` and `cx.spawn_in`. These can be held across await points.
+3. **Prefix my response** with status indicator:
+   - `[Memory Bank: Active]` — If I successfully read the memory bank files
+   - `[Memory Bank: Missing]` — If `.memory-bank/` doesn't exist or is empty
 
-## `Window`
+4. **Briefly confirm understanding** (1-2 sentences): include the current milestone and the immediate technical objective.
+   ```
+[Memory Bank: Active] Milestone: Current testing phase. Objective: Validate performance across all relevant dimensions.
+   ```
 
-`Window` provides access to the state of an application window. It is passed to functions as an argument named `window` and comes before `cx` when present. It is used for managing focus, dispatching actions, directly drawing, getting user input state, etc.
+5. **If Memory Bank is missing**: Warn user about potential issues and suggest initialization.
 
-## Entities
+**IMPORTANT**: This protocol applies to EVERY task, not just session start. The status prefix helps the user verify context is loaded correctly.
 
-An `Entity<T>` is a handle to state of type `T`. With `thing: Entity<T>`:
+---
 
-* `thing.entity_id()` returns `EntityId`
-* `thing.downgrade()` returns `WeakEntity<T>`
-* `thing.read(cx: &App)` returns `&T`.
-* `thing.read_with(cx, |thing: &T, cx: &App| ...)` returns the closure's return value.
-* `thing.update(cx, |thing: &mut T, cx: &mut Context<T>| ...)` allows the closure to mutate the state, and provides a `Context<T>` for interacting with the entity. It returns the closure's return value.
-* `thing.update_in(cx, |thing: &mut T, window: &mut Window, cx: &mut Context<T>| ...)` takes a `AsyncWindowContext` or `VisualTestContext`. It's the same as `update` while also providing the `Window`.
+## Session Start Protocol (MANDATORY)
 
-Within the closures, the inner `cx` provided to the closure must be used instead of the outer `cx` to avoid issues with multiple borrows.
+### Step 1: Verify Memory Bank Exists
+```bash
+ls .memory-bank/
+```
+If missing → Run **Initialization Protocol** below.
 
-Trying to update an entity while it's already being updated must be avoided as this will cause a panic.
+### Step 2: Load Context (in this order)
+1. `.memory-bank/02-CURRENT-STATE.md` — What's happening now
+2. `.memory-bank/03-CONSTRAINTS.md` — Rules I must follow
+3. `.memory-bank/00-PROJECT-BRIEF.md` — If scope questions arise
 
-When  `read_with`, `update`, or `update_in` are used with an async context, the closure's return value is wrapped in an `anyhow::Result`.
+### Step 3: Confirm Alignment
+Summarize to user in 2-3 sentences:
+- What was accomplished last session
+- Current milestone/blockers
+- Immediate next steps
 
-`WeakEntity<T>` is a weak handle. It has `read_with`, `update`, and `update_in` methods that work the same, but always return an `anyhow::Result` so that they can fail if the entity no longer exists. This can be useful to avoid memory leaks - if entities have mutually recursive handles to each other they will never be dropped.
+Only proceed after user confirms understanding is correct.
 
-## Concurrency
+---
 
-All use of entities and UI rendering occurs on a single foreground thread.
+## During Session
 
-`cx.spawn(async move |cx| ...)` runs an async closure on the foreground thread. Within the closure, `cx` is `&mut AsyncApp`.
+### Before Any Code Change
+1. Check `03-CONSTRAINTS.md` for violations
+2. Validate against forbidden patterns
+3. Proceed only if compliant
 
-When the outer cx is a `Context<T>`, the use of `spawn` instead looks like `cx.spawn(async move |this, cx| ...)`, where `this: WeakEntity<T>` and `cx: &mut AsyncApp`.
+### Architectural Integrity (ADR)
+For any significant design shift:
+1. Create an ADR in `.memory-bank/context/decisions/`
+2. Log the ADR in `99-CHANGELOG.md`
 
-To do work on other threads, `cx.background_spawn(async move { ... })` is used. Often this background task is awaited on by a foreground task which uses the results to update state.
+### After Any File Modification
+Log immediately to `99-CHANGELOG.md`:
+```
+[YYYY-MM-DD HH:MM] ACTION: path/to/file - Description
+```
+Actions: `CREATE`, `MODIFY`, `DELETE`, `RENAME`, `REFACTOR`
 
-Both `cx.spawn` and `cx.background_spawn` return a `Task<R>`, which is a future that can be awaited upon. If this task is dropped, then its work is cancelled. To prevent this one of the following must be done:
+### After Milestone Completion
+Update `02-CURRENT-STATE.md`:
+- Mark completed items
+- Update progress percentage
+- Add any new blockers or issues
 
-* Awaiting the task in some other async context.
-* Detaching the task via `task.detach()` or `task.detach_and_log_err(cx)`, allowing it to run indefinitely.
-* Storing the task in a field, if the work should be halted when the struct is dropped.
+---
 
-A task which doesn't do anything but provide a value can be created with `Task::ready(value)`.
+## Session End Protocol
 
-## Elements
+When user says "done", "wrap up", "stopping", session is ending, or approaching context limits:
 
-The `Render` trait is used to render some state into an element tree that is laid out using flexbox layout. An `Entity<T>` where `T` implements `Render` is sometimes called a "view".
+1. **Log session to changelog**:
+   ```
+   [YYYY-MM-DD HH:MM] SESSION: End - Summary of work done
+   ```
 
-Example:
+2. **Update `02-CURRENT-STATE.md`**:
+   - Last Session Summary: What was accomplished
+   - Active Milestone: Current progress %
+   - Immediate Next Steps: Specific, actionable, with file paths
+   - Working Context: Uncommitted thoughts / pending logic needed to continue
+
+3. **Shadow Check**: If this chat history were deleted, confirm `.memory-bank/` is sufficient for a new instance to continue perfectly. If not, update the Memory Bank before ending.
+
+4. **Provide handoff block**: Output a concise next-session handoff (milestone, objective, blockers, next steps, key files).
+
+5. **Confirm handoff**: Tell user what the next session needs to know
+
+
+---
+
+## Conflict Resolution (Source of Truth Priority)
+
+When information conflicts between files, higher priority wins:
 
 ```
-struct TextWithBorder(SharedString);
-
-impl Render for TextWithBorder {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().border_1().child(self.0.clone())
-    }
-}
+1. 00-PROJECT-BRIEF.md   ← HIGHEST (mission/scope)
+2. 03-CONSTRAINTS.md     ← Rules override implementation
+3. 01-ARCHITECTURE.md    ← Design decisions
+4. 02-CURRENT-STATE.md   ← Current status
+5. 99-CHANGELOG.md       ← LOWEST (historical record)
 ```
 
-Since `impl IntoElement for SharedString` exists, it can be used as an argument to `child`. `SharedString` is used to avoid copying strings, and is either an `&'static str` or `Arc<str>`.
+If conflict found: Update lower-priority file to match higher, log the resolution.
 
-UI components that are constructed just to be turned into elements can instead implement the `RenderOnce` trait, which is similar to `Render`, but its `render` method takes ownership of `self` and receives `&mut App` instead of `&mut Context<Self>`. Types that implement this trait can use `#[derive(IntoElement)]` to use them directly as children.
+---
 
-The style methods on elements are similar to those used by Tailwind CSS.
+## Context Health Checklist
 
-If some attributes or children of an element tree are conditional, `.when(condition, |this| ...)` can be used to run the closure only when `condition` is true. Similarly, `.when_some(option, |this, value| ...)` runs the closure when the `Option` has a value.
+Run this audit if Memory Bank seems stale or inconsistent:
 
-## Input events
+```
+[ ] All 6 core files exist in .memory-bank/
+[ ] 00-PROJECT-BRIEF.md has mission and ≥1 requirement defined
+[ ] 01-ARCHITECTURE.md reflects actual tech stack
+[ ] 02-CURRENT-STATE.md updated within current/last session
+[ ] 03-CONSTRAINTS.md has ≥1 constraint per category
+[ ] 04-WORKFLOWS.md documents primary dev workflow
+[ ] 99-CHANGELOG.md has entries for recent file changes
+[ ] No conflicts between constraints and implementation
+```
 
-Input event handlers can be registered on an element via methods like `.on_click(|event, window, cx: &mut App| ...)`.
+If failures found: Fix immediately before proceeding.
 
-Often event handlers will want to update the entity that's in the current `Context<T>`. The `cx.listener` method provides this - its use looks like `.on_click(cx.listener(|this: &mut T, event, window, cx: &mut Context<T>| ...)`.
+---
 
-## Actions
+## Memory Bank Files
 
-Actions are dispatched via user keyboard interaction or in code via `window.dispatch_action(SomeAction.boxed_clone(), cx)` or `focus_handle.dispatch_action(&SomeAction, window, cx)`.
+| File | Layer | Purpose | Update Frequency |
+|------|-------|---------|------------------|
+| `00-PROJECT-BRIEF.md` | Foundation | What & Why | Only on scope change |
+| `01-ARCHITECTURE.md` | Technical | How | On architectural decisions |
+| `02-CURRENT-STATE.md` | Current | Now | Every session |
+| `03-CONSTRAINTS.md` | Policies | Rules | When policies change |
+| `04-WORKFLOWS.md` | Workflow | Repeatability | When processes change |
+| `99-CHANGELOG.md` | History | Past | After every file change |
 
-Actions with no data defined with the `actions!(some_namespace, [SomeAction, AnotherAction])` macro call. Otherwise the `Action` derive macro is used. Doc comments on actions are displayed to the user.
 
-Action handlers can be registered on an element via the event handler `.on_action(|action, window, cx| ...)`. Like other event handlers, this is often used with `cx.listener`.
+**Primary Content (Documentation Schema)**
+- `00-PROJECT-BRIEF.md`: Core mission, scope, and success criteria
+- `01-ARCHITECTURE.md`: Tech stack, design patterns, and component mapping
+- `02-CURRENT-STATE.md`: Active focus, milestones, and immediate next steps
+- `03-CONSTRAINTS.md`: Hard rules, security standards, and lessons learned
+- `04-WORKFLOWS.md`: Build/deploy steps and repetitive task procedures
+- `99-CHANGELOG.md`: Chronological audit trail of all project changes
 
-## Notify
+---
 
-When a view's state has changed in a way that may affect its rendering, it should call `cx.notify()`. This will cause the view to be rerendered. It will also cause any observe callbacks registered for the entity with `cx.observe` to be called.
+## Bootstrap Protocol (`/init`)
+- **Existing projects**: Perform a comprehensive codebase scan to generate/populate `.memory-bank/`.
+- **Empty projects**: Run a structured interview to define:
+  1. Core Mission
+  2. Technical Stack
+  3. Primary Milestone
+  4. Known Constraints
 
-## Entity events
+---
 
-While updating an entity (`cx: Context<T>`), it can emit an event using `cx.emit(event)`. Entities register which events they can emit by declaring `impl EventEmitter<EventType> for EntityType {}`.
+## Synchronization Protocol (`/update`)
+- Execute a global re-analysis of all project files.
+- Re-map architectural patterns and update Memory Bank state files.
+- Transition session "Lessons Learned" into permanent rules in `03-CONSTRAINTS.md`.
 
-Other entities can then register a callback to handle these events by doing `cx.subscribe(other_entity, |this, other_entity, event, cx| ...)`. This will return a `Subscription` which deregisters the callback when dropped.  Typically `cx.subscribe` happens when creating a new entity and the subscriptions are stored in a `_subscriptions: Vec<Subscription>` field.
 
-## Build guidelines
+---
 
-- Use `./script/clippy` instead of `cargo clippy`
-- Always invoke `cargo` commands with the `-q` flag
+## Initialization Protocol
+
+If `.memory-bank/` does not exist, create it with these files:
+
+```bash
+mkdir -p .memory-bank/context/decisions
+```
+
+### 00-PROJECT-BRIEF.md
+```markdown
+# Project Brief
+
+## Mission
+[One sentence: what this project does and why]
+
+## Core Requirements
+1. [Must-have requirement]
+2. [Must-have requirement]
+3. [Must-have requirement]
+
+## Success Criteria
+- [Measurable outcome that defines success]
+- [Measurable outcome that defines success]
+
+## User Experience Targets
+- [Key UX goal]
+- [Key UX goal]
+
+## Out of Scope
+- [Explicit exclusion to prevent scope creep]
+- [Explicit exclusion to prevent scope creep]
+```
+
+### 01-ARCHITECTURE.md
+```markdown
+# Architecture
+
+## Tech Stack
+| Layer | Technology | Version |
+|-------|------------|---------|
+| Language | | |
+| Framework | | |
+| Database | | |
+| Testing | | |
+| Build | | |
+
+## Directory Structure
+[Document key directories and their purposes]
+
+## Design Patterns
+- [Pattern in use and why]
+
+## Key Components
+- [Component]: [Purpose]
+
+## Integration Points
+- [External API/service]
+```
+
+### 02-CURRENT-STATE.md
+```markdown
+# Current State
+
+## Last Updated
+[YYYY-MM-DD HH:MM]
+
+## Last Session Summary
+No previous session recorded.
+
+## Active Milestone
+**[Name]**: [Description]
+- Progress: 0%
+- Blockers: None
+- Target: [Date]
+
+## Immediate Next Steps
+1. [ ] Complete project brief
+2. [ ] Document architecture
+3. [ ] Define constraints
+4. [ ] Begin implementation
+
+## Known Issues
+| ID | Severity | Description | Status |
+|----|----------|-------------|--------|
+| - | - | None | - |
+
+## Working Context
+Memory Bank initialized. Awaiting project setup.
+```
+
+### 03-CONSTRAINTS.md
+```markdown
+# Constraints
+
+## Technical Constraints
+- [Hard limit: e.g., "Must support Node 18+"]
+
+## Security Policies
+- No hardcoded secrets or credentials
+- All user input must be sanitized
+- [Project-specific security rule]
+
+## Code Standards
+- [Style guide: e.g., "Follow PEP 8"]
+- All public functions require docstrings
+- [Project-specific standard]
+
+## Forbidden Patterns
+- [Anti-pattern to avoid]
+- [Anti-pattern to avoid]
+
+## Pre-Change Validation
+Before committing any change:
+- [ ] Follows established patterns
+- [ ] No constraint violations
+- [ ] Security policies maintained
+- [ ] Tests pass (if applicable)
+```
+
+### 04-WORKFLOWS.md
+```markdown
+# Workflows
+
+## Development Workflow
+1. Read current state from Memory Bank
+2. Implement changes
+3. Run tests
+4. Log changes to changelog
+5. Update current state
+
+## Testing
+\`\`\`bash
+# [Add test command]
+\`\`\`
+
+## Build
+\`\`\`bash
+# [Add build command]
+\`\`\`
+
+## Deploy
+\`\`\`bash
+# [Add deploy command]
+\`\`\`
+
+## Common Tasks
+
+### Add Dependency
+\`\`\`bash
+# [Add command]
+\`\`\`
+
+### Run Locally
+\`\`\`bash
+# [Add command]
+\`\`\`
+```
+
+### 99-CHANGELOG.md
+```markdown
+# Changelog
+
+Format: `[YYYY-MM-DD HH:MM] ACTION: path - description`
+
+**Actions**: CREATE, MODIFY, DELETE, RENAME, REFACTOR, SESSION
+
+---
+
+## Entries
+
+[YYYY-MM-DD HH:MM] CREATE: .memory-bank/ - Initialized Memory Bank
+```
+
+After creating all files, prompt user to fill in project-specific details.
+
+---
+
+## Project Commands
+
+```bash
+# Build
+# [TODO: Add build command]
+
+# Test
+# [TODO: Add test command]
+
+# Lint
+# [TODO: Add lint command]
+
+# Run
+# [TODO: Add run command]
+```
+
+---
+
+## Project-Specific Constraints
+
+[Add any constraints specific to this project that aren't in 03-CONSTRAINTS.md]
+
+---
+
+## Notes
+
+- Memory Bank uses standard Markdown for human readability
+- All timestamps use ISO 8601 format: YYYY-MM-DD HH:MM
+- Context window limits: Update current state before approaching limits
+- ADRs (Architecture Decision Records) go in `.memory-bank/context/decisions/`

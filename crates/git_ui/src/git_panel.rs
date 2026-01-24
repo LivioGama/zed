@@ -210,6 +210,7 @@ fn git_panel_context_menu(
 }
 
 const GIT_PANEL_KEY: &str = "GitPanel";
+const OPEN_GIT_GRAPH_ACTION: &str = "git_graph::OpenGitGraph";
 
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
@@ -4125,6 +4126,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         self.active_repository.as_ref()?;
+        let focus_handle = self.focus_handle.clone();
 
         let (text, action, stage, tooltip) =
             if self.total_staged_count() == self.entry_count && self.entry_count > 0 {
@@ -4161,6 +4163,29 @@ impl GitPanel {
                     h_flex()
                         .gap_1()
                         .child(self.render_overflow_menu("overflow_menu"))
+                        .child(
+                            panel_button("Graph")
+                                .icon(IconName::GitBranchAlt)
+                                .tooltip(move |_, cx| {
+                                    if let Ok(action) = cx.build_action(OPEN_GIT_GRAPH_ACTION, None)
+                                    {
+                                        Tooltip::for_action_in(
+                                            "Open Git Graph",
+                                            action.as_ref(),
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    } else {
+                                        Tooltip::simple("Open Git Graph", cx)
+                                    }
+                                })
+                                .on_click(|_, window, cx| {
+                                    if let Ok(action) = cx.build_action(OPEN_GIT_GRAPH_ACTION, None)
+                                    {
+                                        window.dispatch_action(action, cx);
+                                    }
+                                }),
+                        )
                         .child(
                             panel_filled_button(text)
                                 .tooltip(Tooltip::for_action_title_in(
