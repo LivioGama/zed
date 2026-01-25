@@ -7,7 +7,7 @@ use gpui::{
     PathBuilder, Pixels, Point as GpuiPoint, ReadGlobal, Render, Subscription, Window, actions,
     canvas, div, point, prelude::*, px, size,
 };
-use language::{Buffer, Point};
+use language::{Buffer, Point, language_settings::SoftWrap};
 use multi_buffer::{Anchor, MultiBuffer, MultiBufferRow};
 use settings::{SettingsStore, update_settings_file};
 use std::path::PathBuf;
@@ -502,6 +502,7 @@ impl DiffViewer {
             editor.set_read_only(true);
             editor.set_show_gutter(true, cx);
             editor.set_vertical_scrollbar_on_left(true, cx);
+            editor.set_soft_wrap_mode(SoftWrap::None, cx);
             editor
         });
 
@@ -520,6 +521,7 @@ impl DiffViewer {
             editor.set_read_only(true);
             editor.set_show_gutter(true, cx);
             editor.set_show_scrollbars(true, cx);
+            editor.set_soft_wrap_mode(SoftWrap::None, cx);
             editor
         });
 
