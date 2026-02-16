@@ -31,6 +31,7 @@ use gpui::{
 use language::DiagnosticSeverity;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use notifications::status_toast::{StatusToast, ToastIcon};
+use picker::{Picker, PickerDelegate};
 use project::{
     Entry, EntryKind, Fs, GitEntry, GitEntryRef, GitTraversal, Project, ProjectEntryId,
     ProjectPath, Worktree, WorktreeId,
@@ -54,7 +55,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use theme::ThemeSettings;
 use ui::{
@@ -69,8 +70,8 @@ use util::{
     rel_path::{RelPath, RelPathBuf},
 };
 use workspace::{
-    DraggedSelection, OpenInTerminal, OpenOptions, OpenVisible, PreviewTabsSettings, SelectedEntry,
-    SplitDirection, Workspace,
+    DraggedSelection, ModalView, OpenInTerminal, OpenOptions, OpenVisible, PreviewTabsSettings,
+    SelectedEntry, SplitDirection, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
 };
@@ -215,6 +216,13 @@ struct EditState {
     previously_focused: Option<SelectedEntry>,
     validation_state: ValidationState,
     temporarily_unfolded: Option<ProjectEntryId>,
+}
+
+#[derive(Clone)]
+struct LocalHistorySnapshot {
+    project_path: ProjectPath,
+    captured_at: SystemTime,
+    text: String,
 }
 
 impl EditState {
@@ -364,6 +372,8 @@ actions!(
         SelectPrevDirectory,
         /// Opens a diff view to compare two marked files.
         CompareMarkedFiles,
+        /// Opens local history for the selected file or directory.
+        OpenLocalHistory,
     ]
 );
 
@@ -479,6 +489,12 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &Delete, window, cx| {
             if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.delete(action, window, cx));
+            }
+        });
+
+        workspace.register_action(|workspace, _: &OpenLocalHistory, window, cx| {
+            if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.open_local_history(window, cx));
             }
         });
 
@@ -1200,6 +1216,7 @@ impl ProjectPanel {
                                 menu.separator()
                                     .action("View File History", Box::new(git::FileHistory))
                             })
+                            .action("View Local History", Box::new(OpenLocalHistory))
                             .when(!should_hide_rename, |menu| {
                                 menu.separator().action("Rename", Box::new(Rename))
                             })
@@ -1261,6 +1278,79 @@ impl ProjectPanel {
             }
         }
         false
+    }
+
+    fn open_local_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let Some((_worktree, entry)) = self.selected_sub_entry(cx) else {
+            return;
+        };
+
+        let selected_path = ProjectPath {
+            worktree_id: selection.worktree_id,
+            path: entry.path.clone(),
+        };
+        let is_directory = entry.is_dir();
+
+        let mut snapshots = self
+            .project
+            .read(cx)
+            .local_history_for_prefix(&selected_path)
+            .into_iter()
+            .flat_map(|(project_path, entries)| {
+                entries.into_iter().map(move |entry| LocalHistorySnapshot {
+                    project_path: project_path.clone(),
+                    captured_at: entry.captured_at,
+                    text: entry.text,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        snapshots.sort_by_key(|snapshot| {
+            std::cmp::Reverse(
+                snapshot
+                    .captured_at
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map_or(0, |duration| duration.as_secs()),
+            )
+        });
+
+        if snapshots.is_empty() {
+            let message = if is_directory {
+                "No local history snapshots for the selected folder."
+            } else {
+                "No local history snapshots for the selected file."
+            };
+            let toast = StatusToast::new(message, cx, |this, _| {
+                this.icon(ToastIcon::new(IconName::Info).color(Color::Info))
+                    .dismiss_button(true)
+            });
+            self.workspace
+                .update(cx, |workspace, cx| workspace.toggle_status_toast(toast, cx))
+                .ok();
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = self.project.clone();
+        let workspace_handle = workspace.downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                LocalHistoryPickerModal::new(
+                    selected_path,
+                    snapshots,
+                    project.clone(),
+                    workspace_handle.clone(),
+                    window,
+                    cx,
+                )
+            });
+        });
     }
 
     fn is_unfoldable(&self, entry: &Entry, worktree: &Worktree) -> bool {
@@ -6939,6 +7029,190 @@ impl ClipboardEntry {
             ClipboardEntry::Copied(_) => self,
             ClipboardEntry::Cut(entries) => ClipboardEntry::Copied(entries),
         }
+    }
+}
+
+struct LocalHistoryPickerModal {
+    picker: Entity<Picker<LocalHistoryPickerDelegate>>,
+}
+
+impl LocalHistoryPickerModal {
+    fn new(
+        selected_path: ProjectPath,
+        snapshots: Vec<LocalHistorySnapshot>,
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let delegate = LocalHistoryPickerDelegate::new(
+            cx.entity().downgrade(),
+            selected_path,
+            snapshots,
+            project,
+            workspace,
+        );
+        let picker = cx.new(|cx| Picker::nonsearchable_uniform_list(delegate, window, cx));
+        Self { picker }
+    }
+}
+
+impl Render for LocalHistoryPickerModal {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().w(rems(44.)).child(self.picker.clone())
+    }
+}
+
+impl Focusable for LocalHistoryPickerModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl EventEmitter<DismissEvent> for LocalHistoryPickerModal {}
+impl ModalView for LocalHistoryPickerModal {}
+
+struct LocalHistoryPickerDelegate {
+    modal: WeakEntity<LocalHistoryPickerModal>,
+    selected_path: ProjectPath,
+    snapshots: Vec<LocalHistorySnapshot>,
+    selected_index: usize,
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl LocalHistoryPickerDelegate {
+    fn new(
+        modal: WeakEntity<LocalHistoryPickerModal>,
+        selected_path: ProjectPath,
+        snapshots: Vec<LocalHistorySnapshot>,
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+    ) -> Self {
+        Self {
+            modal,
+            selected_path,
+            snapshots,
+            selected_index: 0,
+            project,
+            workspace,
+        }
+    }
+
+    fn unix_seconds(timestamp: SystemTime) -> u64 {
+        timestamp
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map_or(0, |duration| duration.as_secs())
+    }
+}
+
+impl PickerDelegate for LocalHistoryPickerDelegate {
+    type ListItem = ListItem;
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        format!(
+            "Local History: {}",
+            self.selected_path.path.as_ref().display(PathStyle::local())
+        )
+        .into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(snapshot) = self.snapshots.get(self.selected_index).cloned() else {
+            self.dismissed(window, cx);
+            return;
+        };
+        let create_buffer = self
+            .project
+            .update(cx, |project, cx| project.create_buffer(None, false, cx));
+
+        self.dismissed(window, cx);
+
+        let workspace = self.workspace.clone();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let buffer = create_buffer.await?;
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, snapshot.text.clone())], None, cx);
+                buffer.set_capability(language::Capability::ReadOnly, cx);
+            });
+
+            workspace.update(cx, |workspace, cx| {
+                window_handle.update(cx, |_, window, cx| {
+                    let buffer = buffer.clone();
+                    workspace.add_item_to_active_pane(
+                        Box::new(cx.new(|cx| {
+                            let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                            editor.set_read_only(true);
+                            editor
+                        })),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                })
+            })??;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.modal
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .log_err();
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        _query: String,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        Task::ready(())
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let snapshot = self.snapshots.get(ix)?;
+        let captured_at = Self::unix_seconds(snapshot.captured_at);
+        let item_label = format!(
+            "{}  (t={captured_at})",
+            snapshot.project_path.path.as_ref().display(PathStyle::local())
+        );
+
+        Some(
+            ListItem::new(ix)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(Label::new(item_label)),
+        )
     }
 }
 

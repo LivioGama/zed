@@ -8,6 +8,7 @@ pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
 pub mod image_store;
+pub mod local_history;
 pub mod lsp_command;
 pub mod lsp_store;
 pub mod manifest_tree;
@@ -37,6 +38,7 @@ use itertools::Either;
 
 use crate::{
     git_store::GitStore,
+    local_history::{LocalHistory, LocalHistoryEntry},
     lsp_store::{SymbolLocation, log_store::LogKind},
     project_search::SearchResultsHandle,
     trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
@@ -126,7 +128,7 @@ use std::{
     pin::pin,
     str::{self, FromStr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use task_store::TaskStore;
@@ -242,6 +244,7 @@ pub struct Project {
     toolchain_store: Option<Entity<ToolchainStore>>,
     agent_location: Option<AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
+    local_history: LocalHistory,
 }
 
 struct DownloadingFile {
@@ -1332,6 +1335,7 @@ impl Project {
 
                 agent_location: None,
                 downloading_files: Default::default(),
+                local_history: LocalHistory::default(),
             }
         })
     }
@@ -1563,6 +1567,7 @@ impl Project {
                 toolchain_store: Some(toolchain_store),
                 agent_location: None,
                 downloading_files: Default::default(),
+                local_history: LocalHistory::default(),
             };
 
             // remote server -> local machine handlers
@@ -1839,6 +1844,7 @@ impl Project {
                 toolchain_store: None,
                 agent_location: None,
                 downloading_files: Default::default(),
+                local_history: LocalHistory::default(),
             };
             project.set_role(role, cx);
             for worktree in worktrees {
@@ -2245,6 +2251,22 @@ impl Project {
             SearchInputKind::Include => &mut self.search_included_history,
             SearchInputKind::Exclude => &mut self.search_excluded_history,
         }
+    }
+
+    #[inline]
+    pub fn local_history_for_path(&self, path: &ProjectPath) -> &[LocalHistoryEntry] {
+        self.local_history.entries_for_path(path)
+    }
+
+    #[inline]
+    pub fn local_history_for_prefix(
+        &self,
+        prefix: &ProjectPath,
+    ) -> Vec<(ProjectPath, Vec<LocalHistoryEntry>)> {
+        self.local_history
+            .entries_for_prefix(prefix)
+            .map(|(path, entries)| (path.clone(), entries.to_vec()))
+            .collect()
     }
 
     #[inline]
@@ -3633,6 +3655,13 @@ impl Project {
 
         let buffer_id = buffer.read(cx).remote_id();
         match event {
+            BufferEvent::Saved => {
+                if let Some(project_path) = buffer.read(cx).project_path(cx) {
+                    let text = buffer.read(cx).text_snapshot().as_rope().to_string();
+                    self.local_history
+                        .add_entry(project_path, SystemTime::now(), text);
+                }
+            }
             BufferEvent::ReloadNeeded => {
                 if !self.is_via_collab() {
                     self.reload_buffers([buffer.clone()].into_iter().collect(), true, cx)
