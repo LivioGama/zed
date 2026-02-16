@@ -103,6 +103,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub use_modifier_to_send: Option<bool>,
+    /// Whether creating a new chat replaces the current chat in the agent panel.
+    ///
+    /// When set to false, `New` opens the new chat as a separate tab in the active workspace pane.
+    ///
+    /// Default: true
+    pub new_chat_replaces_current: Option<bool>,
     /// Minimum number of lines of height the agent message editor should have.
     ///
     /// Default: 4

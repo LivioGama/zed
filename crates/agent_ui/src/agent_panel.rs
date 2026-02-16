@@ -66,7 +66,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, ToggleZoom, ToolbarItemView, Workspace,
+    CollaboratorId, DraggedSelection, DraggedTab, Item, ToggleZoom, ToolbarItemView, Workspace,
     WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
 };
@@ -901,18 +901,36 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        self.set_active_view(
-            ActiveView::text_thread(
-                text_thread_editor.clone(),
-                self.language_registry.clone(),
+        if AgentSettings::get_global(cx).new_chat_replaces_current {
+            self.set_active_view(
+                ActiveView::text_thread(
+                    text_thread_editor.clone(),
+                    self.language_registry.clone(),
+                    window,
+                    cx,
+                ),
+                true,
                 window,
                 cx,
-            ),
-            true,
-            window,
-            cx,
-        );
-        text_thread_editor.focus_handle(cx).focus(window, cx);
+            );
+            text_thread_editor.focus_handle(cx).focus(window, cx);
+        } else if let Some(workspace) = self.workspace.upgrade() {
+            let text_thread_editor = text_thread_editor.clone();
+            let workspace = workspace.downgrade();
+            cx.defer_in(window, move |_, window, cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.add_item_to_active_pane(
+                            Box::new(text_thread_editor.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            });
+        }
     }
 
     fn external_thread(
@@ -1838,7 +1856,53 @@ impl AgentPanel {
             )
         });
 
-        self.set_active_view(ActiveView::AgentThread { thread_view }, true, window, cx);
+        if AgentSettings::get_global(cx).new_chat_replaces_current {
+            self.set_active_view(ActiveView::AgentThread { thread_view }, true, window, cx);
+        } else if let Some(workspace) = self.workspace.upgrade() {
+            let thread_view = thread_view.clone();
+            let workspace = workspace.downgrade();
+            cx.defer_in(window, move |_, window, cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.add_item_to_active_pane(
+                            Box::new(cx.new(|_| AgentThreadTabItem(thread_view.clone()))),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            });
+        }
+    }
+}
+
+struct AgentThreadTabItem(Entity<AcpServerView>);
+
+impl Item for AgentThreadTabItem {
+    type Event = ();
+
+    fn include_in_nav_history() -> bool {
+        false
+    }
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        self.0.read(cx).title(cx)
+    }
+}
+
+impl EventEmitter<()> for AgentThreadTabItem {}
+
+impl Focusable for AgentThreadTabItem {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.0.focus_handle(cx)
+    }
+}
+
+impl Render for AgentThreadTabItem {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.0.clone().into_any_element()
     }
 }
 

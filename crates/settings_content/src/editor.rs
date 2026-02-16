@@ -423,6 +423,11 @@ pub struct GutterContent {
     ///
     /// Default: true
     pub runnables: Option<bool>,
+    /// Whether clicking a runnable npm script in the gutter should run it directly,
+    /// without opening the Run/Debug popover.
+    ///
+    /// Default: false
+    pub run_npm_scripts_directly: Option<bool>,
     /// Whether to show breakpoints in the gutter.
     ///
     /// Default: true

@@ -128,6 +128,7 @@ pub struct Gutter {
     pub min_line_number_digits: usize,
     pub line_numbers: bool,
     pub runnables: bool,
+    pub run_npm_scripts_directly: bool,
     pub breakpoints: bool,
     pub folds: bool,
 }
@@ -242,6 +243,7 @@ impl Settings for EditorSettings {
                 min_line_number_digits: gutter.min_line_number_digits.unwrap(),
                 line_numbers: gutter.line_numbers.unwrap(),
                 runnables: gutter.runnables.unwrap(),
+                run_npm_scripts_directly: gutter.run_npm_scripts_directly.unwrap(),
                 breakpoints: gutter.breakpoints.unwrap(),
                 folds: gutter.folds.unwrap(),
             },
