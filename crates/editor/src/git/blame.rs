@@ -523,12 +523,7 @@ impl GitBlame {
                             let id = buffer.read(cx).remote_id();
                             let snapshot = buffer.read(cx).snapshot();
                             let buffer_edits = buffer.update(cx, |buffer, _| buffer.subscribe());
-                            let remote_url = project
-                                .read(cx)
-                                .git_store()
-                                .read(cx)
-                                .repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
-                                .and_then(|(repo, _)| repo.read(cx).default_remote_url());
+                            let remote_url: Option<String> = None;
                             let blame_buffer = project
                                 .update(cx, |project, cx| project.blame_buffer(&buffer, None, cx));
                             Ok(async move {

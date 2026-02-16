@@ -218,6 +218,10 @@ impl EditorElement {
         self.split_side = Some(side);
     }
 
+    pub fn with_vertical_scrollbar_on_left(self, _on_left: bool) -> Self {
+        self
+    }
+
     fn should_show_buffer_headers(&self) -> bool {
         self.split_side.is_none()
     }

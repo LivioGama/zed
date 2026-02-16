@@ -15,6 +15,7 @@ use askpass::AskPassDelegate;
 use cloud_llm_client::CompletionIntent;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KEY_VALUE_STORE;
+use diff_viewer::DiffViewer;
 use editor::{
     Direction, Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset,
     actions::ExpandAllDiffHunks,
@@ -1213,27 +1214,58 @@ impl GitPanel {
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         maybe!({
             let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
-            let workspace = self.workspace.upgrade()?;
-            let git_repo = self.active_repository.as_ref()?;
+            self.workspace.upgrade()?;
+            let git_repo = self.active_repository.clone()?;
+            let project_path = git_repo
+                .read(cx)
+                .repo_path_to_project_path(&entry.repo_path, cx)?;
+            let repo_path = entry.repo_path.clone();
+            let project = self.project.clone();
 
-            if let Some(project_diff) = workspace.read(cx).active_item_as::<ProjectDiff>(cx)
-                && let Some(project_path) = project_diff.read(cx).active_path(cx)
-                && Some(&entry.repo_path)
-                    == git_repo
-                        .read(cx)
-                        .project_path_to_repo_path(&project_path, cx)
-                        .as_ref()
-            {
-                project_diff.focus_handle(cx).focus(window, cx);
-                project_diff.update(cx, |project_diff, cx| project_diff.autoscroll(cx));
-                return None;
-            };
-
-            self.workspace
+            let viewer = self
+                .workspace
                 .update(cx, |workspace, cx| {
-                    ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+                    let viewer = cx.new(|cx| {
+                        let mut viewer = DiffViewer::new(None, None, window, cx);
+                        viewer.initialize(window, cx);
+                        viewer
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(viewer.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    viewer
                 })
-                .ok();
+                .ok()?;
+
+            window
+                .spawn(cx, async move |cx| {
+                    let left_content = git_repo
+                        .update(cx, |repo, cx| repo.get_committed_text(repo_path, cx))
+                        .await;
+
+                    let right_buffer = project
+                        .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                        .await?;
+
+                    let right_content = right_buffer.read_with(cx, |buffer, _| buffer.text());
+
+                    viewer.update(cx, |viewer, cx| {
+                        viewer.update_content(left_content, right_content, cx);
+                        viewer.set_language_from_source_buffers(
+                            Some(&right_buffer),
+                            Some(&right_buffer),
+                            cx,
+                        );
+                    });
+
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+
             self.focus_handle.focus(window, cx);
 
             Some(())
@@ -1999,12 +2031,12 @@ impl GitPanel {
         cx.spawn({
             async move |this, cx| {
                 let stash_task = active_repository
-                    .update(cx, |repo, cx| repo.stash_all(cx))
+                    .update(cx, |repo, _cx| repo.stash_all(false, None))
                     .await;
                 this.update(cx, |this, cx| {
                     stash_task
                         .map_err(|e| {
-                            this.show_error_toast("stash", e, cx);
+                            this.show_error_toast("stash", e.into(), cx);
                         })
                         .ok();
                     cx.notify();
@@ -4183,6 +4215,16 @@ impl GitPanel {
                 .child(
                     h_flex()
                         .gap_1()
+                        .child(
+                            panel_icon_button("git-graph-button", IconName::GitGraph)
+                                .icon_size(IconSize::Small)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action("Open Git Graph", &Open, cx)
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Open.boxed_clone(), cx)
+                                }),
+                        )
                         .child(self.render_overflow_menu("overflow_menu"))
                         .child(
                             panel_filled_button(text)
@@ -4459,7 +4501,7 @@ impl GitPanel {
 
     fn render_previous_commit(
         &self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let active_repository = self.active_repository.as_ref()?;
@@ -4517,46 +4559,26 @@ impl GitPanel {
                             }
                         }),
                 )
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .when(commit.has_parent, |this| {
-                            let has_unstaged = self.has_unstaged_changes();
-                            this.child(
-                                panel_icon_button("undo", IconName::Undo)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(move |_window, cx| {
-                                        Tooltip::with_meta(
-                                            "Uncommit",
-                                            Some(&git::Uncommit),
-                                            if has_unstaged {
-                                                "git reset HEAD^ --soft"
-                                            } else {
-                                                "git reset HEAD^"
-                                            },
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.uncommit(window, cx)
-                                        }),
-                                    ),
-                            )
-                        })
-                        .when(window.is_action_available(&Open, cx), |this| {
-                            this.child(
-                                panel_icon_button("git-graph-button", IconName::GitGraph)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(|_window, cx| {
-                                        Tooltip::for_action("Open Git Graph", &Open, cx)
-                                    })
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Open.boxed_clone(), cx)
-                                    }),
-                            )
-                        }),
-                ),
+                .child(h_flex().gap_0p5().when(commit.has_parent, |this| {
+                    let has_unstaged = self.has_unstaged_changes();
+                    this.child(
+                        panel_icon_button("undo", IconName::Undo)
+                            .icon_size(IconSize::Small)
+                            .tooltip(move |_window, cx| {
+                                Tooltip::with_meta(
+                                    "Uncommit",
+                                    Some(&git::Uncommit),
+                                    if has_unstaged {
+                                        "git reset HEAD^ --soft"
+                                    } else {
+                                        "git reset HEAD^"
+                                    },
+                                    cx,
+                                )
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| this.uncommit(window, cx))),
+                    )
+                })),
         )
     }
 
@@ -5713,7 +5735,7 @@ impl GitPanelMessageTooltip {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let remote_url = repository.read(cx).default_remote_url();
+        let remote_url: Option<String> = None;
         cx.new(|cx| {
             cx.spawn_in(window, async move |this, cx| {
                 let (details, workspace) = git_panel.update(cx, |git_panel, cx| {

@@ -6,8 +6,9 @@ use crate::{
     resolve_active_repository,
 };
 use anyhow::{Context as _, Result, anyhow};
-use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
+use buffer_diff::{BufferDiff, DiffHunk, DiffHunkSecondaryStatus};
 use collections::{HashMap, HashSet};
+use diff_viewer::DiffViewer;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
@@ -16,7 +17,7 @@ use editor::{
 };
 
 use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
+    Commit, RestoreFile, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
     repository::{Branch, RepoPath, Upstream, UpstreamTracking, UpstreamTrackingStatus},
     status::FileStatus,
 };
@@ -54,11 +55,29 @@ actions!(
     [
         /// Shows the diff between the working directory and the index.
         Diff,
+        /// Shows the side-by-side diff for the current file.
+        SideBySideDiff,
         /// Adds files to the git staging area.
         Add,
         /// Shows the diff between the working directory and your default
         /// branch (typically main or master).
         BranchDiff,
+        /// Moves focus to the next file in the current git diff.
+        NextDiffFile,
+        /// Moves focus to the previous file in the current git diff.
+        PreviousDiffFile,
+        /// Reverts all changes for the currently active file in the diff.
+        RevertCurrentDiffFile,
+        /// Refreshes the diff and git panel statuses.
+        RefreshDiff,
+        /// Toggles ignoring whitespace-only changes in the current diff.
+        ToggleIgnoreWhitespaceDiff,
+        /// Toggles ignoring empty-line-only changes in the current diff.
+        ToggleIgnoreEmptyLinesDiff,
+        /// Toggles synchronized scrolling between split diff panes.
+        ToggleSyncDiffScroll,
+        /// Toggles word-level diff highlights within changed lines.
+        ToggleWordDiffHighlights,
         LeaderAndFollower,
     ]
 );
@@ -72,6 +91,10 @@ pub struct ProjectDiff {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
+    ignore_whitespace: bool,
+    ignore_empty_lines: bool,
+    sync_scroll_enabled: bool,
+    word_diff_highlights_enabled: bool,
     review_comment_count: usize,
     _task: Task<Result<()>>,
     _subscription: Subscription,
@@ -91,7 +114,64 @@ const NEW_SORT_PREFIX: u64 = 3;
 impl ProjectDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy);
+        workspace.register_action(Self::deploy_side_by_side);
         workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(|workspace, _: &NextDiffFile, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.next_diff_file(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &PreviousDiffFile, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.previous_diff_file(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &RevertCurrentDiffFile, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.revert_current_diff_file(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &RefreshDiff, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.refresh_diff_now(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &ToggleIgnoreWhitespaceDiff, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.toggle_ignore_whitespace_diff(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &ToggleIgnoreEmptyLinesDiff, window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.toggle_ignore_empty_lines_diff(window, cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &ToggleSyncDiffScroll, _window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.toggle_sync_diff_scroll(cx);
+                });
+            }
+        });
+        workspace.register_action(|workspace, _: &ToggleWordDiffHighlights, _window, cx| {
+            if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.toggle_word_diff_highlights(cx);
+                });
+            }
+        });
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy(workspace, &Diff, window, cx);
         });
@@ -105,6 +185,76 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         Self::deploy_at(workspace, None, window, cx)
+    }
+
+    fn deploy_side_by_side(
+        workspace: &mut Workspace,
+        _: &SideBySideDiff,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let active_item = workspace.active_item(cx);
+        let Some(editor) = active_item.and_then(|item| item.downcast::<Editor>()) else {
+            return;
+        };
+
+        let project = workspace.project().clone();
+        let project_path = editor.read(cx).project_path(cx);
+
+        if let Some(project_path) = project_path {
+            let workspace_handle = cx.entity();
+            let git_repo = resolve_active_repository(workspace, cx);
+
+            if let Some(git_repo) = git_repo {
+                let repo_path = git_repo
+                    .read(cx)
+                    .project_path_to_repo_path(&project_path, cx);
+
+                if let Some(repo_path) = repo_path {
+                    let viewer = workspace_handle.update(cx, |workspace, cx| {
+                        let viewer = cx.new(|cx| {
+                            let mut viewer = DiffViewer::new(None, None, window, cx);
+                            viewer.initialize(window, cx);
+                            viewer
+                        });
+                        workspace.add_item_to_active_pane(
+                            Box::new(viewer.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        viewer
+                    });
+
+                    window
+                        .spawn(cx, async move |cx| {
+                            let left_content = git_repo
+                                .update(cx, |repo, cx| repo.get_committed_text(repo_path, cx))
+                                .await;
+
+                            let right_buffer = project
+                                .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                                .await?;
+
+                            let right_content =
+                                right_buffer.read_with(cx, |buffer, _| buffer.text());
+
+                            viewer.update(cx, |viewer, cx| {
+                                viewer.update_content(left_content, right_content, cx);
+                                viewer.set_language_from_source_buffers(
+                                    Some(&right_buffer),
+                                    Some(&right_buffer),
+                                    cx,
+                                );
+                            });
+
+                            anyhow::Ok(())
+                        })
+                        .detach_and_log_err(cx);
+                }
+            }
+        }
     }
 
     fn deploy_branch_diff(
@@ -253,17 +403,26 @@ impl ProjectDiff {
         let Some(repo) = project.read(cx).git_store().read(cx).active_repository() else {
             return Task::ready(Err(anyhow!("No active repository")));
         };
-        let main_branch = repo.update(cx, |repo, _| repo.default_branch(true));
+        let tracked_branch = repo.read(cx).branch.as_ref().and_then(|branch| {
+            branch
+                .upstream
+                .as_ref()
+                .and_then(|upstream| upstream.branch_name())
+                .map(ToOwned::to_owned)
+        });
+        let default_branch = repo.update(cx, |repo, _| repo.default_branch(true));
         window.spawn(cx, async move |cx| {
-            let main_branch = main_branch
-                .await??
-                .context("Could not determine default branch")?;
+            let base_ref = if let Some(tracked_branch) = tracked_branch {
+                tracked_branch.into()
+            } else {
+                default_branch
+                    .await??
+                    .context("Could not determine default branch")?
+            };
 
             let branch_diff = cx.new_window_entity(|window, cx| {
                 branch_diff::BranchDiff::new(
-                    DiffBase::Merge {
-                        base_ref: main_branch,
-                    },
+                    DiffBase::Merge { base_ref },
                     project.clone(),
                     window,
                     cx,
@@ -396,6 +555,10 @@ impl ProjectDiff {
             multibuffer,
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
+            ignore_whitespace: false,
+            ignore_empty_lines: false,
+            sync_scroll_enabled: true,
+            word_diff_highlights_enabled: true,
             review_comment_count: 0,
             _task: task,
             _subscription: Subscription::join(
@@ -488,6 +651,196 @@ impl ProjectDiff {
         } else {
             self.pending_scroll = Some(path_key);
         }
+    }
+
+    fn active_path_key(&self, cx: &App) -> Option<PathKey> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let (excerpt_id, _, _) = editor.active_excerpt(cx)?;
+        self.multibuffer.read(cx).path_for_excerpt(excerpt_id)
+    }
+
+    fn has_multiple_files(&self, cx: &App) -> bool {
+        self.multibuffer.read(cx).paths().nth(1).is_some()
+    }
+
+    fn has_active_file(&self, cx: &App) -> bool {
+        self.active_path_key(cx).is_some()
+    }
+
+    fn move_to_adjacent_diff_file(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut paths: Vec<PathKey> = self.multibuffer.read(cx).paths().cloned().collect();
+        if paths.is_empty() {
+            return;
+        }
+
+        paths.sort();
+        let current_index = self
+            .active_path_key(cx)
+            .and_then(|path| paths.iter().position(|candidate| candidate == &path));
+
+        let target_index = match current_index {
+            Some(index) if forward => (index + 1) % paths.len(),
+            Some(index) => {
+                if index == 0 {
+                    paths.len().saturating_sub(1)
+                } else {
+                    index - 1
+                }
+            }
+            None if forward => 0,
+            None => paths.len().saturating_sub(1),
+        };
+
+        if let Some(path) = paths.get(target_index).cloned() {
+            self.move_to_path(path, window, cx);
+        }
+    }
+
+    fn next_diff_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to_adjacent_diff_file(true, window, cx);
+    }
+
+    fn previous_diff_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to_adjacent_diff_file(false, window, cx);
+    }
+
+    fn revert_current_diff_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_path_key) = self.active_path_key(cx) else {
+            return;
+        };
+        let Some(active_position) = self
+            .multibuffer
+            .read(cx)
+            .location_for_path(&active_path_key, cx)
+        else {
+            return;
+        };
+
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([active_position..active_position]);
+                });
+                editor.restore_file(&RestoreFile::default(), window, cx);
+            })
+        });
+        self.refresh_diff_now(window, cx);
+    }
+
+    fn refresh_diff_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_refresh(RefreshReason::StatusesChanged, window, cx);
+    }
+
+    fn toggle_ignore_whitespace_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ignore_whitespace = !self.ignore_whitespace;
+        self.refresh_diff_now(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_ignore_empty_lines_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ignore_empty_lines = !self.ignore_empty_lines;
+        self.refresh_diff_now(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_sync_diff_scroll(&mut self, cx: &mut Context<Self>) {
+        self.sync_scroll_enabled = !self.sync_scroll_enabled;
+        let sync_scroll_enabled = self.sync_scroll_enabled;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_sync_scroll_enabled(sync_scroll_enabled, cx);
+        });
+        cx.notify();
+    }
+
+    fn toggle_word_diff_highlights(&mut self, cx: &mut Context<Self>) {
+        self.word_diff_highlights_enabled = !self.word_diff_highlights_enabled;
+        let word_diff_highlights_enabled = self.word_diff_highlights_enabled;
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |rhs_editor, cx| {
+                rhs_editor.set_show_word_diff_highlights(word_diff_highlights_enabled, cx);
+            });
+            if let Some(lhs_editor) = editor.lhs_editor().cloned() {
+                lhs_editor.update(cx, |lhs_editor, cx| {
+                    lhs_editor.set_show_word_diff_highlights(word_diff_highlights_enabled, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    fn request_refresh(
+        &mut self,
+        reason: RefreshReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._task = window.spawn(cx, {
+            let this = cx.weak_entity();
+            async move |cx| Self::refresh(this, reason, cx).await
+        });
+    }
+
+    fn normalize_for_filter(
+        content: &str,
+        ignore_whitespace: bool,
+        ignore_empty_lines: bool,
+    ) -> String {
+        if !ignore_whitespace && !ignore_empty_lines {
+            return content.to_string();
+        }
+
+        let mut normalized = String::with_capacity(content.len());
+        if ignore_empty_lines {
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if ignore_whitespace {
+                    for ch in line.chars() {
+                        if !ch.is_whitespace() {
+                            normalized.push(ch);
+                        }
+                    }
+                } else {
+                    normalized.push_str(line);
+                    normalized.push('\n');
+                }
+            }
+
+            if !ignore_whitespace && normalized.ends_with('\n') {
+                normalized.pop();
+            }
+        } else {
+            for ch in content.chars() {
+                if !ch.is_whitespace() {
+                    normalized.push(ch);
+                }
+            }
+        }
+
+        normalized
+    }
+
+    fn hunk_is_filtered(
+        hunk: &DiffHunk,
+        buffer_snapshot: &language::BufferSnapshot,
+        base_snapshot: &language::BufferSnapshot,
+        ignore_whitespace: bool,
+        ignore_empty_lines: bool,
+    ) -> bool {
+        let buffer_text: String = buffer_snapshot
+            .text_for_range(hunk.buffer_range.clone())
+            .collect();
+        let base_text: String = base_snapshot
+            .text_for_range(hunk.diff_base_byte_range.clone())
+            .collect();
+        Self::normalize_for_filter(&buffer_text, ignore_whitespace, ignore_empty_lines)
+            == Self::normalize_for_filter(&base_text, ignore_whitespace, ignore_empty_lines)
     }
 
     /// Returns the total count of review comments across all hunks/files.
@@ -629,7 +982,12 @@ impl ProjectDiff {
             .expect("project diff editor should have a conflict addon");
 
         let snapshot = buffer.read(cx).snapshot();
-        let diff_snapshot = diff.read(cx).snapshot(cx);
+        let diff_read = diff.read(cx);
+        let diff_snapshot = diff_read.snapshot(cx);
+        let ignore_whitespace = self.ignore_whitespace;
+        let ignore_empty_lines = self.ignore_empty_lines;
+        let base_snapshot =
+            (ignore_whitespace || ignore_empty_lines).then(|| diff_read.base_text(cx));
 
         let excerpt_ranges = {
             let diff_hunk_ranges = diff_snapshot
@@ -637,7 +995,21 @@ impl ProjectDiff {
                     Anchor::min_max_range_for_buffer(snapshot.remote_id()),
                     &snapshot,
                 )
-                .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
+                .filter_map(|diff_hunk| {
+                    if let Some(base_snapshot) = base_snapshot.as_ref() {
+                        let filtered = Self::hunk_is_filtered(
+                            &diff_hunk,
+                            &snapshot,
+                            base_snapshot,
+                            ignore_whitespace,
+                            ignore_empty_lines,
+                        );
+                        if filtered {
+                            return None;
+                        }
+                    }
+                    Some(diff_hunk.buffer_range.to_point(&snapshot))
+                });
             let conflicts = conflict_addon
                 .conflict_set(snapshot.remote_id())
                 .map(|conflict_set| conflict_set.read(cx).snapshot().conflicts)
@@ -653,6 +1025,14 @@ impl ProjectDiff {
                 diff_hunk_ranges.collect()
             }
         };
+
+        if excerpt_ranges.is_empty() {
+            self.buffer_diff_subscriptions.remove(&path_key.path);
+            self.multibuffer.update(cx, |multibuffer, cx| {
+                multibuffer.remove_excerpts_for_path(path_key.clone(), cx);
+            });
+            return;
+        }
 
         let (was_empty, is_excerpt_newly_added) = self.editor.update(cx, |editor, cx| {
             let was_empty = editor.rhs_editor().read(cx).buffer().read(cx).is_empty();
@@ -1322,6 +1702,12 @@ impl Render for ProjectDiffToolbar {
         };
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
+        let has_multiple_files = project_diff.read(cx).has_multiple_files(cx);
+        let has_active_file = project_diff.read(cx).has_active_file(cx);
+        let ignore_whitespace = project_diff.read(cx).ignore_whitespace;
+        let ignore_empty_lines = project_diff.read(cx).ignore_empty_lines;
+        let sync_scroll_enabled = project_diff.read(cx).sync_scroll_enabled;
+        let word_diff_highlights_enabled = project_diff.read(cx).word_diff_highlights_enabled;
         let review_count = project_diff.read(cx).total_review_comment_count();
 
         h_group_xl()
@@ -1409,6 +1795,116 @@ impl Render for ProjectDiffToolbar {
                             .disabled(!button_states.prev_next)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dispatch_action(&GoToHunk, window, cx)
+                            })),
+                    ),
+            )
+            .child(vertical_divider())
+            .child(
+                h_group_sm()
+                    .child(
+                        IconButton::new("previous-file", IconName::ArrowLeft)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Go to previous file",
+                                &PreviousDiffFile,
+                                &focus_handle,
+                            ))
+                            .disabled(!has_multiple_files)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&PreviousDiffFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("next-file", IconName::ArrowRight)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Go to next file",
+                                &NextDiffFile,
+                                &focus_handle,
+                            ))
+                            .disabled(!has_multiple_files)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&NextDiffFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("revert-file", "Revert File")
+                            .disabled(!has_active_file)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Revert current file",
+                                &RevertCurrentDiffFile,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&RevertCurrentDiffFile, window, cx)
+                            })),
+                    ),
+            )
+            .child(vertical_divider())
+            .child(
+                h_group_sm()
+                    .child(
+                        IconButton::new("refresh-diff", IconName::ArrowCircle)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Refresh diff",
+                                &RefreshDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&RefreshDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("ignore-whitespace", IconName::Filter)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(ignore_whitespace)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Ignore whitespace-only changes",
+                                &ToggleIgnoreWhitespaceDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleIgnoreWhitespaceDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("ignore-empty-lines", IconName::Return)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(ignore_empty_lines)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Ignore empty-line-only changes",
+                                &ToggleIgnoreEmptyLinesDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleIgnoreEmptyLinesDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("toggle-sync-scroll", IconName::Link)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(sync_scroll_enabled)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Toggle synchronized split scrolling",
+                                &ToggleSyncDiffScroll,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleSyncDiffScroll, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("toggle-word-diff", IconName::FileDiff)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(word_diff_highlights_enabled)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Toggle word-level diff highlights",
+                                &ToggleWordDiffHighlights,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleWordDiffHighlights, window, cx)
                             })),
                     ),
             )
@@ -1550,6 +2046,11 @@ impl Render for BranchDiffToolbar {
             return div();
         };
         let focus_handle = project_diff.focus_handle(cx);
+        let has_multiple_files = project_diff.read(cx).has_multiple_files(cx);
+        let ignore_whitespace = project_diff.read(cx).ignore_whitespace;
+        let ignore_empty_lines = project_diff.read(cx).ignore_empty_lines;
+        let sync_scroll_enabled = project_diff.read(cx).sync_scroll_enabled;
+        let word_diff_highlights_enabled = project_diff.read(cx).word_diff_highlights_enabled;
         let review_count = project_diff.read(cx).total_review_comment_count();
 
         h_group_xl()
@@ -1558,6 +2059,99 @@ impl Render for BranchDiffToolbar {
             .items_center()
             .flex_wrap()
             .justify_end()
+            .child(
+                h_group_sm()
+                    .child(
+                        IconButton::new("branch-previous-file", IconName::ArrowLeft)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Go to previous file",
+                                &PreviousDiffFile,
+                                &focus_handle,
+                            ))
+                            .disabled(!has_multiple_files)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&PreviousDiffFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-next-file", IconName::ArrowRight)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Go to next file",
+                                &NextDiffFile,
+                                &focus_handle,
+                            ))
+                            .disabled(!has_multiple_files)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&NextDiffFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-refresh-diff", IconName::ArrowCircle)
+                            .shape(ui::IconButtonShape::Square)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Refresh diff",
+                                &RefreshDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&RefreshDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-ignore-whitespace", IconName::Filter)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(ignore_whitespace)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Ignore whitespace-only changes",
+                                &ToggleIgnoreWhitespaceDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleIgnoreWhitespaceDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-ignore-empty-lines", IconName::Return)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(ignore_empty_lines)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Ignore empty-line-only changes",
+                                &ToggleIgnoreEmptyLinesDiff,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleIgnoreEmptyLinesDiff, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-toggle-sync-scroll", IconName::Link)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(sync_scroll_enabled)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Toggle synchronized split scrolling",
+                                &ToggleSyncDiffScroll,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleSyncDiffScroll, window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("branch-toggle-word-diff", IconName::FileDiff)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(word_diff_highlights_enabled)
+                            .tooltip(Tooltip::for_action_title_in(
+                                "Toggle word-level diff highlights",
+                                &ToggleWordDiffHighlights,
+                                &focus_handle,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&ToggleWordDiffHighlights, window, cx)
+                            })),
+                    ),
+            )
             .when(review_count > 0, |el| {
                 el.child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(

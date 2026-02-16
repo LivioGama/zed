@@ -370,6 +370,7 @@ pub struct SplittableEditor {
     rhs_multibuffer: Entity<MultiBuffer>,
     rhs_editor: Entity<Editor>,
     lhs: Option<LhsEditor>,
+    sync_scroll_enabled: bool,
     workspace: WeakEntity<Workspace>,
     split_state: Entity<SplitEditorState>,
     searched_side: Option<SplitSide>,
@@ -410,6 +411,51 @@ impl SplittableEditor {
                 editor.set_render_diff_hunk_controls(render_diff_hunk_controls.clone(), cx);
             });
         }
+    }
+
+    pub fn set_sync_scroll_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.sync_scroll_enabled == enabled {
+            return;
+        }
+        self.sync_scroll_enabled = enabled;
+
+        let Some(lhs) = &self.lhs else {
+            return;
+        };
+
+        if enabled {
+            let shared_scroll_anchor = self
+                .rhs_editor
+                .read(cx)
+                .scroll_manager
+                .scroll_anchor_entity();
+            lhs.editor.update(cx, |editor, _cx| {
+                editor
+                    .scroll_manager
+                    .set_shared_scroll_anchor(shared_scroll_anchor);
+            });
+            return;
+        }
+
+        let rhs_shared_scroll_anchor = self
+            .rhs_editor
+            .read(cx)
+            .scroll_manager
+            .shared_scroll_anchor(cx);
+        let rhs_scroll_anchor_entity = cx.new(|_| rhs_shared_scroll_anchor);
+        self.rhs_editor.update(cx, |editor, _cx| {
+            editor
+                .scroll_manager
+                .set_shared_scroll_anchor(rhs_scroll_anchor_entity);
+        });
+
+        let lhs_shared_scroll_anchor = lhs.editor.read(cx).scroll_manager.shared_scroll_anchor(cx);
+        let lhs_scroll_anchor_entity = cx.new(|_| lhs_shared_scroll_anchor);
+        lhs.editor.update(cx, |editor, _cx| {
+            editor
+                .scroll_manager
+                .set_shared_scroll_anchor(lhs_scroll_anchor_entity);
+        });
     }
 
     fn focused_side(&self) -> SplitSide {
@@ -495,6 +541,7 @@ impl SplittableEditor {
             rhs_editor,
             rhs_multibuffer,
             lhs: None,
+            sync_scroll_enabled: true,
             workspace: workspace.downgrade(),
             split_state,
             searched_side: None,
@@ -698,16 +745,18 @@ impl SplittableEditor {
             dm.set_companion(Some((lhs_display_map, companion.clone())), cx);
         });
 
-        let shared_scroll_anchor = self
-            .rhs_editor
-            .read(cx)
-            .scroll_manager
-            .scroll_anchor_entity();
-        lhs.editor.update(cx, |editor, _cx| {
-            editor
+        if self.sync_scroll_enabled {
+            let shared_scroll_anchor = self
+                .rhs_editor
+                .read(cx)
                 .scroll_manager
-                .set_shared_scroll_anchor(shared_scroll_anchor);
-        });
+                .scroll_anchor_entity();
+            lhs.editor.update(cx, |editor, _cx| {
+                editor
+                    .scroll_manager
+                    .set_shared_scroll_anchor(shared_scroll_anchor);
+            });
+        }
 
         let this = cx.entity().downgrade();
         self.rhs_editor.update(cx, |editor, _cx| {

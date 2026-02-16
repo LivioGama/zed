@@ -1174,6 +1174,7 @@ pub struct Editor {
     show_breadcrumbs: bool,
     show_gutter: bool,
     show_scrollbars: ScrollbarAxes,
+    vertical_scrollbar_on_left: bool,
     minimap_visibility: MinimapVisibility,
     offset_content: bool,
     disable_expand_excerpt_buttons: bool,
@@ -1188,6 +1189,7 @@ pub struct Editor {
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
+    show_word_diff_highlights: bool,
     show_diff_review_button: bool,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
@@ -1399,6 +1401,7 @@ pub struct EditorSnapshot {
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
+    show_word_diff_highlights: bool,
     git_blame_gutter_max_author_length: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
@@ -2405,6 +2408,7 @@ impl Editor {
                 horizontal: full_mode,
                 vertical: full_mode,
             },
+            vertical_scrollbar_on_left: false,
             minimap_visibility: MinimapVisibility::for_mode(&mode, cx),
             offset_content: !matches!(mode, EditorMode::SingleLine),
             show_breadcrumbs: EditorSettings::get_global(cx).toolbar.breadcrumbs,
@@ -2421,6 +2425,7 @@ impl Editor {
             show_code_actions: None,
             show_runnables: None,
             show_breakpoints: None,
+            show_word_diff_highlights: true,
             show_diff_review_button: false,
             show_wrap_guides: None,
             show_indent_guides,
@@ -3171,6 +3176,7 @@ impl Editor {
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_breakpoints: self.show_breakpoints,
+            show_word_diff_highlights: self.show_word_diff_highlights,
             git_blame_gutter_max_author_length,
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             display_snapshot,
@@ -6683,17 +6689,32 @@ impl Editor {
         cx.spawn_in(window, async move |editor, cx| {
             let (resolved_tasks, debug_scenarios, task_context) = runnable_task.await?;
             let code_actions = code_actions_task.await;
-            let spawn_straight_away = quick_launch
-                && resolved_tasks
-                    .as_ref()
-                    .is_some_and(|tasks| tasks.templates.len() == 1)
-                && code_actions
-                    .as_ref()
-                    .is_none_or(|actions| actions.is_empty())
-                && debug_scenarios.is_empty();
 
             editor.update_in(cx, |editor, window, cx| {
                 crate::hover_popover::hide_hover(editor, cx);
+                let has_single_task = resolved_tasks
+                    .as_ref()
+                    .is_some_and(|tasks| tasks.templates.len() == 1);
+                let has_no_code_actions = code_actions
+                    .as_ref()
+                    .is_none_or(|actions| actions.is_empty());
+                let spawn_straight_away = quick_launch
+                    && has_single_task
+                    && has_no_code_actions
+                    && debug_scenarios.is_empty();
+                let bypass_popover_for_npm_script = quick_launch
+                    && matches!(deployed_from, Some(CodeActionSource::RunMenu(_)))
+                    && EditorSettings::get_global(cx)
+                        .gutter
+                        .run_npm_scripts_directly
+                    && has_single_task
+                    && has_no_code_actions
+                    && resolved_tasks.as_ref().is_some_and(|tasks| {
+                        tasks
+                            .templates
+                            .first()
+                            .is_some_and(|(_, task)| Self::is_npm_script_task(task))
+                    });
                 let actions = CodeActionContents::new(
                     resolved_tasks,
                     code_actions,
@@ -6716,7 +6737,7 @@ impl Editor {
                         deployed_from,
                     }));
                 cx.notify();
-                if spawn_straight_away
+                if (spawn_straight_away || bypass_popover_for_npm_script)
                     && let Some(task) = editor.confirm_code_action(
                         &ConfirmCodeAction { item_ix: Some(0) },
                         window,
@@ -6730,6 +6751,15 @@ impl Editor {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn is_npm_script_task(task: &ResolvedTask) -> bool {
+        task.original_task().command == "npm"
+            && task
+                .original_task()
+                .args
+                .first()
+                .is_some_and(|arg| arg == "run")
     }
 
     fn debug_scenarios(
@@ -12012,6 +12042,68 @@ impl Editor {
         } else {
             None
         }
+    }
+
+    pub fn prepare_restore_fragment_change(
+        &self,
+        revert_changes: &mut HashMap<BufferId, Vec<(Range<text::Anchor>, Rope)>>,
+        hunk: &MultiBufferDiffHunk,
+        fragment_range: Range<text::Anchor>,
+        fragment_base_range: Range<usize>,
+        cx: &mut App,
+    ) -> Option<()> {
+        if hunk.is_created_file() {
+            return None;
+        }
+
+        let buffer = self.buffer.read(cx);
+        let diff = buffer.diff_for(hunk.buffer_id)?;
+        let buffer = buffer.buffer(hunk.buffer_id)?;
+        let buffer = buffer.read(cx);
+
+        let original_text = diff
+            .read(cx)
+            .base_text(cx)
+            .as_rope()
+            .slice(fragment_base_range);
+
+        let buffer_snapshot = buffer.snapshot();
+        let buffer_revert_changes = revert_changes.entry(buffer.remote_id()).or_default();
+
+        if let Err(i) = buffer_revert_changes.binary_search_by(|probe| {
+            probe
+                .0
+                .start
+                .cmp(&fragment_range.start, &buffer_snapshot)
+                .then(probe.0.end.cmp(&fragment_range.end, &buffer_snapshot))
+        }) {
+            buffer_revert_changes.insert(i, (fragment_range, original_text));
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    pub fn generate_fragment_buffer_edits(
+        &self,
+        fragment_range: Range<text::Anchor>,
+        original_content: &text::Rope,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<Vec<(Range<text::Anchor>, text::Rope)>> {
+        let buffer = self.buffer.read(cx);
+        let buffer = buffer.buffer(buffer_id)?;
+        let buffer = buffer.read(cx);
+        let buffer_snapshot = buffer.snapshot();
+
+        if !fragment_range.start.is_valid(&buffer_snapshot)
+            || !fragment_range.end.is_valid(&buffer_snapshot)
+        {
+            return None;
+        }
+
+        let edits = vec![(fragment_range, original_content.clone())];
+        Some(edits)
     }
 
     pub fn reverse_lines(&mut self, _: &ReverseLines, window: &mut Window, cx: &mut Context<Self>) {
@@ -21257,6 +21349,11 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_vertical_scrollbar_on_left(&mut self, on_left: bool, cx: &mut Context<Self>) {
+        self.vertical_scrollbar_on_left = on_left;
+        cx.notify();
+    }
+
     pub fn set_minimap_visibility(
         &mut self,
         minimap_visibility: MinimapVisibility,
@@ -21350,6 +21447,19 @@ impl Editor {
     pub fn set_show_breakpoints(&mut self, show_breakpoints: bool, cx: &mut Context<Self>) {
         self.show_breakpoints = Some(show_breakpoints);
         cx.notify();
+    }
+
+    pub fn set_show_word_diff_highlights(
+        &mut self,
+        show_word_diff_highlights: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_word_diff_highlights = show_word_diff_highlights;
+        cx.notify();
+    }
+
+    pub fn show_word_diff_highlights(&self) -> bool {
+        self.show_word_diff_highlights
     }
 
     pub fn set_show_diff_review_button(&mut self, show: bool, cx: &mut Context<Self>) {
@@ -25043,6 +25153,18 @@ impl Editor {
         });
     }
 
+    pub fn restore_fragments(
+        &mut self,
+        fragment_changes: HashMap<BufferId, Vec<(Range<text::Anchor>, Rope)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.transact(window, cx, |editor, window, cx| {
+            editor.restore(fragment_changes, window, cx);
+        });
+        Ok(())
+    }
+
     pub fn to_pixel_point(
         &mut self,
         source: Anchor,
@@ -27325,7 +27447,11 @@ impl EditorSnapshot {
                         status: hunk.status(),
                         diff_base_byte_range: hunk.diff_base_byte_range.start.0
                             ..hunk.diff_base_byte_range.end.0,
-                        word_diffs: hunk.word_diffs,
+                        word_diffs: if self.show_word_diff_highlights {
+                            hunk.word_diffs
+                        } else {
+                            Vec::new()
+                        },
                         display_row_range: hunk_display_start.row()..end_row,
                         multi_buffer_range: Anchor::range_in_buffer(
                             hunk.excerpt_id,
@@ -27347,6 +27473,10 @@ impl EditorSnapshot {
 
     pub fn is_focused(&self) -> bool {
         self.is_focused
+    }
+
+    pub fn show_word_diff_highlights(&self) -> bool {
+        self.show_word_diff_highlights
     }
 
     pub fn placeholder_text(&self) -> Option<String> {
@@ -27735,6 +27865,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         EditorElement::new(&cx.entity(), self.create_style(cx))
+            .with_vertical_scrollbar_on_left(self.vertical_scrollbar_on_left)
     }
 }
 

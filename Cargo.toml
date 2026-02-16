@@ -52,8 +52,8 @@ members = [
     "crates/debugger_ui",
     "crates/deepseek",
     "crates/denoise",
-    "crates/dev_container",
     "crates/diagnostics",
+    "crates/diff_viewer",
     "crates/docs_preprocessor",
     "crates/edit_prediction",
     "crates/edit_prediction_types",
@@ -302,6 +302,7 @@ deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
+diff_viewer = { path = "crates/diff_viewer" }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }
 eval_utils = { path = "crates/eval_utils" }
@@ -565,7 +566,7 @@ markup5ever_rcdom = "0.3.0"
 metal = "0.29"
 minidumper = "0.8"
 moka = { version = "0.12.10", features = ["sync"] }
-naga = { version = "28.0", features = ["wgsl-in"] }
+naga = { version = "28.0", features = ["wgsl-in", "termcolor"] }
 nanoid = "0.4"
 nbformat = "1.0.0"
 nix = "0.29"
