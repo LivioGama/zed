@@ -454,6 +454,111 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn delete_remote_branch(
+        &self,
+        _remote_name: String,
+        _branch_name: String,
+        _askpass: git::repository::AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: gpui::AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        async { Ok(git::repository::RemoteCommandOutput::default()) }.boxed()
+    }
+
+    fn merge_branch(
+        &self,
+        _branch_name: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn rebase_onto(
+        &self,
+        _target_branch: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn squash_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _message: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn drop_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn reword_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _new_message: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn edit_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn revert_commits(
+        &self,
+        _commit_shas: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn abort_cherry_pick(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn continue_cherry_pick(
+        &self,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn abort_revert(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn continue_revert(&self, _env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn stash_all(
+        &self,
+        _include_untracked: bool,
+        _message: Option<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
+    }
+
     fn blame(
         &self,
         path: RepoPath,

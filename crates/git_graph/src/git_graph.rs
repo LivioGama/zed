@@ -955,18 +955,11 @@ impl GitGraph {
 
     fn get_remote(
         &self,
-        repository: &Repository,
+        _repository: &Repository,
         _window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Option<GitRemote> {
-        let remote_url = repository.default_remote_url()?;
-        let provider_registry = GitHostingProviderRegistry::default_global(cx);
-        let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
-        Some(GitRemote {
-            host: provider,
-            owner: parsed.owner.into(),
-            repo: parsed.repo.into(),
-        })
+        None
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
